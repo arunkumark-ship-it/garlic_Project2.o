@@ -157,15 +157,56 @@ HEADERS = {
 }
 
 
+def _fix_private_key(key: str) -> str:
+    """
+    Fix private key formatting issues that cause 'Invalid JWT Signature'.
+    Streamlit Cloud sometimes converts literal \\n to spaces or strips them.
+    This function restores the correct PEM format no matter how it was pasted.
+    """
+    # Strip surrounding whitespace
+    key = key.strip()
+
+    # If the key has no newlines at all, it was stored as one long line
+    # Split it back into proper PEM format
+    if "\\n" in key:
+        # Escaped \n  →  real newline
+        key = key.replace("\\n", "\n")
+
+    # Remove any stray Windows carriage returns
+    key = key.replace("\r", "")
+
+    # Ensure header and footer are on their own lines
+    key = key.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+    key = key.replace("-----END PRIVATE KEY-----",   "\n-----END PRIVATE KEY-----")
+
+    # Collapse multiple blank lines that might have appeared
+    while "\n\n\n" in key:
+        key = key.replace("\n\n\n", "\n\n")
+
+    # Make sure it ends with a newline
+    if not key.endswith("\n"):
+        key += "\n"
+
+    return key
+
+
 @st.cache_resource
 def get_gspread_client():
-    """Connect using credentials.json (local) or st.secrets (Streamlit Cloud)."""
+    """
+    Connect using credentials.json (local) or st.secrets (Streamlit Cloud).
+    Automatically fixes private key formatting to prevent Invalid JWT Signature.
+    """
     creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+
     if os.path.exists(creds_path):
+        # ── Local: read credentials.json directly ────────────────────────────
         creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     else:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=SCOPES)
+        # ── Streamlit Cloud: build dict from secrets, fix the private key ────
+        raw = dict(st.secrets["gcp_service_account"])
+        raw["private_key"] = _fix_private_key(raw["private_key"])
+        creds = Credentials.from_service_account_info(raw, scopes=SCOPES)
+
     return gspread.authorize(creds)
 
 
