@@ -65,7 +65,7 @@ for _k, _v in DEFAULTS.items():
         st.session_state[_k] = _v
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GOOGLE AUTH  —  bulletproof private key repair + connection
+#  GOOGLE AUTH  —  triple-method bulletproof connection
 # ═══════════════════════════════════════════════════════════════════════════════
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -76,71 +76,249 @@ SPREADSHEET_NAME = "Garlic_Order & Delivery Project"
 
 def _clean_private_key(raw_key: str) -> str:
     """
-    Repairs private key no matter how it was copy-pasted into secrets.toml.
-    Handles: literal \\n, real newlines, mixed, extra spaces, missing newlines.
+    Rebuild PEM private key from scratch regardless of how it was stored.
+    Handles every known corruption: literal \\n, spaces, missing headers,
+    wrong line wrapping, Windows CRLF, double-escaped sequences.
     """
-    k = raw_key.strip()
+    k = str(raw_key).strip()
 
-    # Step 1 — turn literal \n text into real newline characters
-    k = k.replace("\\n", "\n")
+    # Remove any surrounding quotes that toml parsers sometimes leave
+    if (k.startswith('"') and k.endswith('"')) or \
+       (k.startswith("'") and k.endswith("'")):
+        k = k[1:-1]
 
-    # Step 2 — strip carriage returns (Windows line endings)
-    k = k.replace("\r", "")
+    # Turn every form of escaped newline into a real newline
+    k = k.replace("\\r\\n", "\n")
+    k = k.replace("\\r",    "\n")
+    k = k.replace("\\n",    "\n")
+    k = k.replace("\r\n",   "\n")
+    k = k.replace("\r",     "\n")
 
-    # Step 3 — remove ALL existing newlines so we have one flat string
+    # Remove ALL newlines and spaces so we have one flat base64 string
     header = "-----BEGIN PRIVATE KEY-----"
     footer = "-----END PRIVATE KEY-----"
-    k = k.replace(header, "").replace(footer, "").replace("\n", "").strip()
+    k = k.replace(header, "")
+    k = k.replace(footer,  "")
+    k = k.replace("\n", "")
+    k = k.replace(" ",  "")
+    k = k.strip()
 
-    # Step 4 — wrap the base64 body at 64 chars (PEM standard)
-    wrapped = "\n".join(textwrap.wrap(k, 64))
+    # Validate — must be non-empty base64-ish content
+    if len(k) < 100:
+        raise ValueError(
+            f"Private key body too short ({len(k)} chars). "
+            "Check your secrets.toml — the full key may not have been pasted."
+        )
 
-    # Step 5 — rebuild proper PEM format
-    return f"{header}\n{wrapped}\n{footer}\n"
-
-
-def _build_creds_dict() -> dict:
-    """Read credentials from secrets.toml and return a clean dict."""
-    raw = dict(st.secrets["gcp_service_account"])
-    raw["private_key"] = _clean_private_key(str(raw["private_key"]))
-    return raw
+    # Re-wrap at exactly 64 characters per line (RFC 7468 / PEM standard)
+    body = "\n".join(textwrap.wrap(k, 64))
+    return f"{header}\n{body}\n{footer}\n"
 
 
-@st.cache_resource
-def get_gspread_client():
-    """Return authorised gspread client. Local = credentials.json, Cloud = secrets."""
-    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+def _get_creds() -> Credentials:
+    """
+    Build Google Credentials using THREE methods in order:
+      1. credentials.json file (local dev)
+      2. st.secrets["gcp_service_account"] as dict (Streamlit Cloud)
+      3. st.secrets["gcp_service_account"] individual keys (alternative format)
+    Raises a clear ValueError if all three fail.
+    """
+    # ── Method 1: local credentials.json file ────────────────────────────────
+    creds_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "credentials.json"
+    )
     if os.path.exists(creds_path):
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_info(_build_creds_dict(), scopes=SCOPES)
+        return Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+
+    # ── Method 2: secrets as a dict block [gcp_service_account] ─────────────
+    try:
+        raw = dict(st.secrets["gcp_service_account"])
+        raw["private_key"] = _clean_private_key(str(raw["private_key"]))
+        # Ensure all required fields are present
+        required = ["type","project_id","private_key_id","private_key",
+                    "client_email","client_id","token_uri"]
+        missing = [f for f in required if not raw.get(f)]
+        if missing:
+            raise ValueError(f"Missing fields in secrets: {missing}")
+        return Credentials.from_service_account_info(raw, scopes=SCOPES)
+    except KeyError:
+        pass   # [gcp_service_account] block not found, try method 3
+    except Exception as e:
+        raise ValueError(f"Method 2 (secrets dict) failed: {e}")
+
+    # ── Method 3: individual top-level secret keys ───────────────────────────
+    try:
+        info = {
+            "type":                        str(st.secrets.get("type","service_account")),
+            "project_id":                  str(st.secrets["project_id"]),
+            "private_key_id":              str(st.secrets["private_key_id"]),
+            "private_key":                 _clean_private_key(str(st.secrets["private_key"])),
+            "client_email":                str(st.secrets["client_email"]),
+            "client_id":                   str(st.secrets["client_id"]),
+            "auth_uri":                    str(st.secrets.get("auth_uri",
+                                               "https://accounts.google.com/o/oauth2/auth")),
+            "token_uri":                   str(st.secrets.get("token_uri",
+                                               "https://oauth2.googleapis.com/token")),
+            "auth_provider_x509_cert_url": str(st.secrets.get("auth_provider_x509_cert_url",
+                                               "https://www.googleapis.com/oauth2/v1/certs")),
+            "client_x509_cert_url":        str(st.secrets.get("client_x509_cert_url","")),
+        }
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+    except KeyError as e:
+        raise ValueError(
+            f"Could not find credentials. Tried credentials.json (not found), "
+            f"st.secrets['gcp_service_account'] (not found), and individual "
+            f"secret keys (missing key: {e}). "
+            f"Please add your Google credentials to Streamlit Cloud Secrets."
+        )
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_client():
+    """Cached gspread client — only created once per app session."""
+    creds = _get_creds()
     return gspread.authorize(creds)
 
 
+def get_gspread_client():
+    """
+    Return gspread client. Clears cache and retries once on auth errors
+    so stale cached credentials never block the app permanently.
+    """
+    try:
+        return _cached_client()
+    except Exception:
+        # Clear stale cache and try fresh
+        _cached_client.clear()
+        creds = _get_creds()
+        return gspread.authorize(creds)
+
+
 def _test_connection():
-    """Try to connect and return (True, client) or (False, error_message)."""
+    """Try to connect. Returns (True, None) or (False, error_string)."""
     try:
         client = get_gspread_client()
-        client.list_spreadsheet_files()   # lightweight ping
-        return True, client
-    except RefreshError as e:
-        return False, f"JWT / Auth error: {e}"
+        client.list_spreadsheet_files()
+        return True, None
     except Exception as e:
-        return False, str(e)
+        err = str(e)
+        # Make error message human-readable
+        if "invalid_grant" in err or "JWT" in err or "RefreshError" in err:
+            return False, "jwt"
+        if "credentials" in err.lower() or "secret" in err.lower():
+            return False, "missing"
+        return False, err
 
 
-# ── Credential debug page shown when connection fails ─────────────────────────
-def page_credential_error(err_msg: str):
-    st.error("🔴 Cannot connect to Google Sheets")
+# ── Credential debug page ─────────────────────────────────────────────────────
+def page_credential_error(err_type: str):
     st.markdown("""
-    ### What went wrong?
-    The private key in your Streamlit Cloud **Secrets** is corrupted.
-    This always causes `Invalid JWT Signature` or `RefreshError`.
+    <div style="background:#fff3cd;border:2px solid #e8a020;border-radius:14px;
+                padding:20px;margin-bottom:16px">
+      <h2 style="color:#854f0b;margin:0 0 8px">🔑 Google Sheets connection failed</h2>
+      <p style="color:#5a4010;margin:0">The app cannot authenticate with Google.
+      Follow the steps below to fix it.</p>
+    </div>""", unsafe_allow_html=True)
 
-    ### Fix it in 3 steps
-    """)
+    st.markdown("### The most common cause")
+    st.error(
+        "The `private_key` in your Streamlit Cloud Secrets is corrupted. "
+        "This happens when the key is copy-pasted incorrectly."
+    )
 
-    st.markdown("#### Step 1 — Get a fresh key from Google Cloud")
+    st.markdown("---")
+    st.markdown("### Fix in 4 steps")
+
+    with st.expander("Step 1 — Create a fresh Google key", expanded=True):
+        st.markdown("""
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. **IAM & Admin → Service Accounts** → click your service account
+3. **Keys tab → Delete** any existing keys
+4. **Add Key → Create new key → JSON** → Download the file
+5. Make sure **Google Sheets API** and **Google Drive API** are both enabled
+        """)
+
+    with st.expander("Step 2 — Share your Google Sheet", expanded=True):
+        st.markdown("""
+1. Open your Google Sheet named **"Garlic_Order & Delivery Project"**
+2. Click **Share** (top right)
+3. Paste the `client_email` from your downloaded JSON file
+4. Set permission to **Editor**
+5. Click **Send**
+        """)
+
+    with st.expander("Step 3 — Paste secrets correctly", expanded=True):
+        st.markdown("Go to **share.streamlit.io → your app → ⋮ → Settings → Secrets**")
+        st.markdown("Delete everything in the box, then paste exactly this format:")
+        st.code("""[gcp_service_account]
+type                        = "service_account"
+project_id                  = "YOUR_PROJECT_ID"
+private_key_id              = "YOUR_KEY_ID"
+private_key                 = "-----BEGIN PRIVATE KEY-----\\nYOUR_KEY_BODY_ALL_ONE_LINE_HERE\\n-----END PRIVATE KEY-----\\n"
+client_email                = "YOUR_BOT@YOUR_PROJECT.iam.gserviceaccount.com"
+client_id                   = "YOUR_CLIENT_ID"
+auth_uri                    = "https://accounts.google.com/o/oauth2/auth"
+token_uri                   = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url        = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_BOT%40YOUR_PROJECT.iam.gserviceaccount.com"
+universe_domain             = "googleapis.com"
+""", language="toml")
+        st.warning(
+            "⚠️ **Critical:** The `private_key` value must be ONE single line "
+            "inside the quotes. All line breaks must be written as `\\n` "
+            "(backslash + n) — NOT real newlines."
+        )
+
+    with st.expander("Step 4 — Redeploy", expanded=True):
+        st.markdown("""
+1. After saving Secrets, click **Reboot app** (or push any commit to GitHub)
+2. Wait ~30 seconds for the app to restart
+3. The connection error should be gone ✅
+        """)
+
+    st.markdown("---")
+    st.markdown("### Debug — what the app sees in your secrets right now")
+    try:
+        raw = dict(st.secrets.get("gcp_service_account", {}))
+        if not raw:
+            st.error("❌ No `[gcp_service_account]` block found in Secrets at all.")
+            st.info("Make sure your secrets start with `[gcp_service_account]` on the first line.")
+        else:
+            pk = str(raw.get("private_key","NOT FOUND"))
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**project_id:** `{raw.get('project_id','❌ missing')}`")
+                st.write(f"**client_email:** `{raw.get('client_email','❌ missing')}`")
+                st.write(f"**private_key_id:** `{raw.get('private_key_id','❌ missing')}`")
+                st.write(f"**token_uri:** `{'✅' if raw.get('token_uri') else '❌ missing'}`")
+            with col2:
+                st.write(f"**private_key length:** `{len(pk)}` chars")
+                st.write(f"**Has BEGIN header:** `{'✅' if '-----BEGIN' in pk else '❌ NO'}`")
+                st.write(f"**Has END footer:** `{'✅' if '-----END' in pk else '❌ NO'}`")
+                st.write(f"**Has real newlines:** `{'✅' if chr(10) in pk else '⚠️ no (using \\\\n)'}`")
+            if len(pk) < 200:
+                st.error(f"❌ Private key is only {len(pk)} characters — it is TRUNCATED. "
+                         "The full key must be ~1600+ characters.")
+            else:
+                st.success(f"✅ Private key length looks OK ({len(pk)} chars)")
+            try:
+                cleaned = _clean_private_key(pk)
+                st.success("✅ Key can be cleaned/repaired successfully by the app")
+            except Exception as ke:
+                st.error(f"❌ Key repair failed: {ke}")
+    except Exception as ex:
+        st.error(f"Cannot read secrets at all: {ex}")
+
+    st.markdown("---")
+    if st.button("🔄 Retry connection now", type="primary"):
+        _cached_client.clear()
+        st.rerun()
+
+
+# IMPORTANT NOTE about the missing code block below:
+# The page_credential_error function above replaces the old one.
+# The old version had this at the end:
+def _placeholder_for_old_code():
     st.code("""
 1. Go to https://console.cloud.google.com
 2. IAM & Admin → Service Accounts
@@ -247,11 +425,44 @@ HEADERS = {
 
 
 def open_spreadsheet():
+    """
+    Open the Google Sheet by name.
+    NEVER auto-creates — avoids the 403 Drive quota error.
+    The sheet must exist and be shared with the service account as Editor.
+    """
     client = get_gspread_client()
     try:
         return client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        return client.create(SPREADSHEET_NAME)
+        # Do NOT call client.create() — it causes 403 Drive quota errors
+        # and fails if the service account has no Drive storage quota.
+        # Instead, show clear instructions and stop.
+        st.markdown(f"""
+<div style="background:#fff3cd;border:2px solid #e8a020;border-radius:14px;padding:20px;margin:10px 0">
+<h3 style="color:#854f0b;margin:0 0 10px">📋 Google Sheet Not Found</h3>
+<p style="color:#5a4010;margin:0 0 12px">
+The app cannot find a sheet named <strong>"{SPREADSHEET_NAME}"</strong>
+in the Google Drive of your service account.<br>
+This is a <strong>one-time setup step</strong> — takes 2 minutes.
+</p>
+<hr style="border-color:#e8a020;margin:12px 0">
+<p style="color:#5a4010;margin:0 0 6px"><strong>Step 1 — Create the sheet:</strong></p>
+<ol style="color:#5a4010;margin:0 0 12px;padding-left:18px">
+<li>Go to <a href="https://sheets.google.com" target="_blank">sheets.google.com</a></li>
+<li>Click <strong>+ Blank spreadsheet</strong></li>
+<li>Rename it exactly to: <code style="background:#fff;padding:2px 6px;border-radius:4px">Garlic_Order &amp; Delivery Project</code></li>
+</ol>
+<p style="color:#5a4010;margin:0 0 6px"><strong>Step 2 — Share it with your service account:</strong></p>
+<ol style="color:#5a4010;margin:0 0 12px;padding-left:18px">
+<li>Click <strong>Share</strong> button (top right of the sheet)</li>
+<li>Paste the <code>client_email</code> from your credentials JSON</li>
+<li>Set permission to <strong>Editor</strong></li>
+<li>Click <strong>Send</strong></li>
+</ol>
+<p style="color:#5a4010;margin:0"><strong>Step 3 — Reboot this app</strong> and the error will be gone ✅</p>
+</div>
+""", unsafe_allow_html=True)
+        st.stop()
 
 
 def get_ws(key: str):
