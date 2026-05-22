@@ -68,7 +68,7 @@ for _k, _v in DEFAULTS.items():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN REGISTER PASSWORD  — FIX #5
 # ═══════════════════════════════════════════════════════════════════════════════
-ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
+ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "NinjaGarlic@2026")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GOOGLE AUTH
