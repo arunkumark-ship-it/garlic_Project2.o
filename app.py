@@ -278,6 +278,13 @@ Create a sheet named <strong>"{SPREADSHEET_NAME}"</strong> and share it with you
 
 
 def get_ws(key: str):
+    """
+    Open (or create) a worksheet. If the sheet already exists but is missing
+    columns that are in HEADERS[key], insert the missing columns at the correct
+    position so existing data is never shifted. This handles schema migrations
+    automatically (e.g. adding 'Email' to UserRegistry that was created before
+    the Email column existed).
+    """
     sp   = open_spreadsheet()
     name = TAB[key]
     try:
@@ -286,6 +293,27 @@ def get_ws(key: str):
         ws = sp.add_worksheet(title=name, rows=2000, cols=40)
         if key in HEADERS:
             ws.append_row(HEADERS[key])
+        return ws
+
+    # ── Auto-migrate: add any missing columns ────────────────────────────────
+    if key in HEADERS:
+        expected = HEADERS[key]
+        current  = ws.row_values(1)   # existing header row (may be empty)
+
+        if not current:
+            # Sheet exists but is completely empty — write headers now
+            ws.append_row(expected)
+        else:
+            # Find columns present in expected but absent in current headers
+            missing_cols = [(i, col) for i, col in enumerate(expected)
+                            if col not in current]
+            for expected_idx, col_name in missing_cols:
+                # Insert column at the correct position (1-based for gspread)
+                insert_pos = expected_idx + 1
+                ws.insert_cols([[col_name]], col=insert_pos)
+                # After insertion the live header row has shifted; re-read it
+                current = ws.row_values(1)
+
     return ws
 
 
@@ -299,7 +327,27 @@ def read_sheet(key: str) -> pd.DataFrame:
 
 
 def append_row(key: str, row: list):
-    get_ws(key).append_row(row, value_input_option="USER_ENTERED")
+    """
+    Write a row using COLUMN NAMES (dict) so the data always lands in the
+    right cell regardless of what order the sheet's header columns are in.
+    Falls back to positional append if the key has no HEADERS definition.
+    """
+    ws = get_ws(key)
+    if key not in HEADERS:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return
+
+    expected_headers = HEADERS[key]
+    if len(row) != len(expected_headers):
+        # Length mismatch — fall back to positional to avoid silent data loss
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return
+
+    # Build a dict {col_name: value} then write into correct column positions
+    data_dict   = dict(zip(expected_headers, row))
+    live_headers = ws.row_values(1)
+    ordered_row  = [data_dict.get(h, "") for h in live_headers]
+    ws.append_row(ordered_row, value_input_option="USER_ENTERED")
 
 
 def update_row(key: str, id_col: str, id_val: str, updates: dict) -> bool:
@@ -391,16 +439,20 @@ def register_user(name, phone, email, role, password):
     return uid, None
 
 # FIX #1: login_user uses Email (mail id) as login identifier
+# Also handles old sheets with "Password Hash" column name
 def login_user(email, password):
     user = find_row("user_registry","Email", email)
-    if not user:        return None, "Email not found."
-    if str(user.get("Password","")) != str(password):
+    if not user:
+        return None, "Email not found. If you registered before this update, contact admin."
+    # Support both old column "Password Hash" and new "Password"
+    stored_pw = str(user.get("Password","") or user.get("Password Hash",""))
+    if stored_pw != str(password):
         return None, "Incorrect password."
     if str(user.get("Status","")).lower() != "active":
         return None, "Account inactive. Contact admin."
     return {"uid":user["UID"],"name":user["Full Name"],
-            "role":user["Role"],"phone":user["Phone"],
-            "email":user["Email"]}, None
+            "role":user["Role"],"phone":str(user.get("Phone","")),
+            "email":str(user.get("Email",""))}, None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI HELPERS
