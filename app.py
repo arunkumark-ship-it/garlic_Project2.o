@@ -548,35 +548,32 @@ def page_login():
                                 st.session_state.driver_id = dr["Driver ID"]
                         st.rerun()
 
-        # FIX #1 + FIX #5: Register stores email; admin role requires gate password
+        # ALL roles require Admin Registration Password to register
         with tab_rg:
-            rn   = st.text_input("Full name", key="rg_name")
-            rph  = st.text_input("Phone number", key="rg_ph")
-            # FIX #1: email is the login id
-            rem  = st.text_input("Email (will be your Login ID) *", placeholder="you@example.com", key="rg_email")
-            rrol = st.selectbox("Role",["sales executive","delivery Driver","admin"], key="rg_role")
-            rpw  = st.text_input("Password", type="password", key="rg_pw")
-            rpw2 = st.text_input("Confirm password", type="password", key="rg_pw2")
-
-            # FIX #5: Show admin gate password field only when admin selected
-            admin_gate = ""
-            if rrol == "admin":
-                admin_gate = st.text_input("Admin Registration Password *",
-                                           type="password", key="rg_admin_gate",
-                                           help="Only admin can register. Contact system admin for this password.")
+            rn   = st.text_input("Full name *", key="rg_name")
+            rph  = st.text_input("Phone number *", key="rg_ph")
+            rem  = st.text_input("Email (Login ID) *", placeholder="you@example.com", key="rg_email")
+            rrol = st.selectbox("Role *", ["sales executive","delivery Driver","admin"], key="rg_role")
+            rpw  = st.text_input("Password *", type="password", key="rg_pw")
+            rpw2 = st.text_input("Confirm password *", type="password", key="rg_pw2")
+            # ALL roles must enter admin gate password — no exceptions
+            admin_gate = st.text_input(
+                "Admin Registration Password *",
+                type="password", key="rg_admin_gate",
+                help="Required for all roles. Contact system admin for this password."
+            )
 
             if st.button("Create account →", type="primary", use_container_width=True, key="rg_btn"):
-                if not all([rn,rph,rem,rpw,rpw2]):
-                    st.error("Fill in all fields.")
+                if not all([rn, rph, rem, rpw, rpw2, admin_gate]):
+                    st.error("Fill in all fields including the Admin Registration Password.")
                 elif rpw != rpw2:
                     st.error("Passwords do not match.")
                 elif len(rpw) < 6:
                     st.error("Password min 6 characters.")
-                elif not rem or "@" not in rem:
+                elif "@" not in rem:
                     st.error("Enter a valid email address.")
-                # FIX #5: gate admin registration with password
-                elif rrol == "admin" and admin_gate != ADMIN_REGISTER_PASSWORD:
-                    st.error("❌ Invalid admin registration password. Contact system admin.")
+                elif admin_gate != ADMIN_REGISTER_PASSWORD:
+                    st.error("❌ Invalid Admin Registration Password. Contact system admin.")
                 else:
                     with st.spinner("Creating account…"):
                         uid, err = register_user(rn, rph, rem.strip().lower(), rrol, rpw)
@@ -584,7 +581,7 @@ def page_login():
                         st.error(f"❌ {err}")
                     else:
                         st.success("✅ Account created!")
-                        st.info(f"Your permanent UID: **`{uid}`** — save this. Login with your email.")
+                        st.info(f"Your UID: **`{uid}`** — save this. Login with your email.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE: ADMIN — All fixes: #6 (log mail id), #7 (shop loc auto), #8 (driver onboard tab),
