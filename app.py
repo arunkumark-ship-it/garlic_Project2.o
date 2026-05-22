@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Garlic Order & Delivery Platform  —  app.py  FINAL                        ║
-# ║  JWT-proof Google auth + credential debug screen                           ║
+# ║  Garlic Order & Delivery Platform  —  app.py  v6                           ║
+# ║  All 11 fixes applied                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 import os, uuid, hashlib, textwrap
 from datetime import datetime, date
@@ -59,13 +59,19 @@ DEFAULTS = {
     "logged_in": False, "user": None,
     "driver_id": None,  "driver_active": True,
     "active_stop": 0,   "cust_data": {},
+    "task_done": False,   # FIX #11: track if all tasks completed before logout
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GOOGLE AUTH  —  triple-method bulletproof connection
+#  ADMIN REGISTER PASSWORD  — FIX #5
+# ═══════════════════════════════════════════════════════════════════════════════
+ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE AUTH
 # ═══════════════════════════════════════════════════════════════════════════════
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -75,26 +81,15 @@ SPREADSHEET_NAME = "Garlic_Order & Delivery Project"
 
 
 def _clean_private_key(raw_key: str) -> str:
-    """
-    Rebuild PEM private key from scratch regardless of how it was stored.
-    Handles every known corruption: literal \\n, spaces, missing headers,
-    wrong line wrapping, Windows CRLF, double-escaped sequences.
-    """
     k = str(raw_key).strip()
-
-    # Remove any surrounding quotes that toml parsers sometimes leave
     if (k.startswith('"') and k.endswith('"')) or \
        (k.startswith("'") and k.endswith("'")):
         k = k[1:-1]
-
-    # Turn every form of escaped newline into a real newline
     k = k.replace("\\r\\n", "\n")
     k = k.replace("\\r",    "\n")
     k = k.replace("\\n",    "\n")
     k = k.replace("\r\n",   "\n")
     k = k.replace("\r",     "\n")
-
-    # Remove ALL newlines and spaces so we have one flat base64 string
     header = "-----BEGIN PRIVATE KEY-----"
     footer = "-----END PRIVATE KEY-----"
     k = k.replace(header, "")
@@ -102,39 +97,19 @@ def _clean_private_key(raw_key: str) -> str:
     k = k.replace("\n", "")
     k = k.replace(" ",  "")
     k = k.strip()
-
-    # Validate — must be non-empty base64-ish content
     if len(k) < 100:
-        raise ValueError(
-            f"Private key body too short ({len(k)} chars). "
-            "Check your secrets.toml — the full key may not have been pasted."
-        )
-
-    # Re-wrap at exactly 64 characters per line (RFC 7468 / PEM standard)
+        raise ValueError(f"Private key body too short ({len(k)} chars).")
     body = "\n".join(textwrap.wrap(k, 64))
     return f"{header}\n{body}\n{footer}\n"
 
 
 def _get_creds() -> Credentials:
-    """
-    Build Google Credentials using THREE methods in order:
-      1. credentials.json file (local dev)
-      2. st.secrets["gcp_service_account"] as dict (Streamlit Cloud)
-      3. st.secrets["gcp_service_account"] individual keys (alternative format)
-    Raises a clear ValueError if all three fail.
-    """
-    # ── Method 1: local credentials.json file ────────────────────────────────
-    creds_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "credentials.json"
-    )
+    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
     if os.path.exists(creds_path):
         return Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-
-    # ── Method 2: secrets as a dict block [gcp_service_account] ─────────────
     try:
         raw = dict(st.secrets["gcp_service_account"])
         raw["private_key"] = _clean_private_key(str(raw["private_key"]))
-        # Ensure all required fields are present
         required = ["type","project_id","private_key_id","private_key",
                     "client_email","client_id","token_uri"]
         missing = [f for f in required if not raw.get(f)]
@@ -142,11 +117,9 @@ def _get_creds() -> Credentials:
             raise ValueError(f"Missing fields in secrets: {missing}")
         return Credentials.from_service_account_info(raw, scopes=SCOPES)
     except KeyError:
-        pass   # [gcp_service_account] block not found, try method 3
+        pass
     except Exception as e:
         raise ValueError(f"Method 2 (secrets dict) failed: {e}")
-
-    # ── Method 3: individual top-level secret keys ───────────────────────────
     try:
         info = {
             "type":                        str(st.secrets.get("type","service_account")),
@@ -155,54 +128,38 @@ def _get_creds() -> Credentials:
             "private_key":                 _clean_private_key(str(st.secrets["private_key"])),
             "client_email":                str(st.secrets["client_email"]),
             "client_id":                   str(st.secrets["client_id"]),
-            "auth_uri":                    str(st.secrets.get("auth_uri",
-                                               "https://accounts.google.com/o/oauth2/auth")),
-            "token_uri":                   str(st.secrets.get("token_uri",
-                                               "https://oauth2.googleapis.com/token")),
-            "auth_provider_x509_cert_url": str(st.secrets.get("auth_provider_x509_cert_url",
-                                               "https://www.googleapis.com/oauth2/v1/certs")),
+            "auth_uri":                    str(st.secrets.get("auth_uri","https://accounts.google.com/o/oauth2/auth")),
+            "token_uri":                   str(st.secrets.get("token_uri","https://oauth2.googleapis.com/token")),
+            "auth_provider_x509_cert_url": str(st.secrets.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")),
             "client_x509_cert_url":        str(st.secrets.get("client_x509_cert_url","")),
         }
         return Credentials.from_service_account_info(info, scopes=SCOPES)
     except KeyError as e:
-        raise ValueError(
-            f"Could not find credentials. Tried credentials.json (not found), "
-            f"st.secrets['gcp_service_account'] (not found), and individual "
-            f"secret keys (missing key: {e}). "
-            f"Please add your Google credentials to Streamlit Cloud Secrets."
-        )
+        raise ValueError(f"Could not find credentials. Missing key: {e}")
 
 
 @st.cache_resource(show_spinner=False)
 def _cached_client():
-    """Cached gspread client — only created once per app session."""
     creds = _get_creds()
     return gspread.authorize(creds)
 
 
 def get_gspread_client():
-    """
-    Return gspread client. Clears cache and retries once on auth errors
-    so stale cached credentials never block the app permanently.
-    """
     try:
         return _cached_client()
     except Exception:
-        # Clear stale cache and try fresh
         _cached_client.clear()
         creds = _get_creds()
         return gspread.authorize(creds)
 
 
 def _test_connection():
-    """Try to connect. Returns (True, None) or (False, error_string)."""
     try:
         client = get_gspread_client()
         client.list_spreadsheet_files()
         return True, None
     except Exception as e:
         err = str(e)
-        # Make error message human-readable
         if "invalid_grant" in err or "JWT" in err or "RefreshError" in err:
             return False, "jwt"
         if "credentials" in err.lower() or "secret" in err.lower():
@@ -210,51 +167,33 @@ def _test_connection():
         return False, err
 
 
-# ── Credential debug page ─────────────────────────────────────────────────────
 def page_credential_error(err_type: str):
     st.markdown("""
     <div style="background:#fff3cd;border:2px solid #e8a020;border-radius:14px;
                 padding:20px;margin-bottom:16px">
       <h2 style="color:#854f0b;margin:0 0 8px">🔑 Google Sheets connection failed</h2>
-      <p style="color:#5a4010;margin:0">The app cannot authenticate with Google.
-      Follow the steps below to fix it.</p>
+      <p style="color:#5a4010;margin:0">The app cannot authenticate with Google.</p>
     </div>""", unsafe_allow_html=True)
-
-    st.markdown("### The most common cause")
-    st.error(
-        "The `private_key` in your Streamlit Cloud Secrets is corrupted. "
-        "This happens when the key is copy-pasted incorrectly."
-    )
-
-    st.markdown("---")
     st.markdown("### Fix in 4 steps")
-
     with st.expander("Step 1 — Create a fresh Google key", expanded=True):
         st.markdown("""
 1. Go to [console.cloud.google.com](https://console.cloud.google.com)
 2. **IAM & Admin → Service Accounts** → click your service account
 3. **Keys tab → Delete** any existing keys
 4. **Add Key → Create new key → JSON** → Download the file
-5. Make sure **Google Sheets API** and **Google Drive API** are both enabled
+5. Enable **Google Sheets API** and **Google Drive API**
         """)
-
     with st.expander("Step 2 — Share your Google Sheet", expanded=True):
         st.markdown("""
 1. Open your Google Sheet named **"Garlic_Order & Delivery Project"**
-2. Click **Share** (top right)
-3. Paste the `client_email` from your downloaded JSON file
-4. Set permission to **Editor**
-5. Click **Send**
+2. Click **Share** → Paste `client_email` → set **Editor** → Send
         """)
-
     with st.expander("Step 3 — Paste secrets correctly", expanded=True):
-        st.markdown("Go to **share.streamlit.io → your app → ⋮ → Settings → Secrets**")
-        st.markdown("Delete everything in the box, then paste exactly this format:")
         st.code("""[gcp_service_account]
 type                        = "service_account"
 project_id                  = "YOUR_PROJECT_ID"
 private_key_id              = "YOUR_KEY_ID"
-private_key                 = "-----BEGIN PRIVATE KEY-----\\nYOUR_KEY_BODY_ALL_ONE_LINE_HERE\\n-----END PRIVATE KEY-----\\n"
+private_key                 = "-----BEGIN PRIVATE KEY-----\\nYOUR_KEY_BODY\\n-----END PRIVATE KEY-----\\n"
 client_email                = "YOUR_BOT@YOUR_PROJECT.iam.gserviceaccount.com"
 client_id                   = "YOUR_CLIENT_ID"
 auth_uri                    = "https://accounts.google.com/o/oauth2/auth"
@@ -262,123 +201,15 @@ token_uri                   = "https://oauth2.googleapis.com/token"
 auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url        = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_BOT%40YOUR_PROJECT.iam.gserviceaccount.com"
 universe_domain             = "googleapis.com"
+
+# FIX #5 — Admin register page password
+admin_register_password     = "YourSecureAdminPassword"
 """, language="toml")
-        st.warning(
-            "⚠️ **Critical:** The `private_key` value must be ONE single line "
-            "inside the quotes. All line breaks must be written as `\\n` "
-            "(backslash + n) — NOT real newlines."
-        )
-
     with st.expander("Step 4 — Redeploy", expanded=True):
-        st.markdown("""
-1. After saving Secrets, click **Reboot app** (or push any commit to GitHub)
-2. Wait ~30 seconds for the app to restart
-3. The connection error should be gone ✅
-        """)
-
-    st.markdown("---")
-    st.markdown("### Debug — what the app sees in your secrets right now")
-    try:
-        raw = dict(st.secrets.get("gcp_service_account", {}))
-        if not raw:
-            st.error("❌ No `[gcp_service_account]` block found in Secrets at all.")
-            st.info("Make sure your secrets start with `[gcp_service_account]` on the first line.")
-        else:
-            pk = str(raw.get("private_key","NOT FOUND"))
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**project_id:** `{raw.get('project_id','❌ missing')}`")
-                st.write(f"**client_email:** `{raw.get('client_email','❌ missing')}`")
-                st.write(f"**private_key_id:** `{raw.get('private_key_id','❌ missing')}`")
-                st.write(f"**token_uri:** `{'✅' if raw.get('token_uri') else '❌ missing'}`")
-            with col2:
-                st.write(f"**private_key length:** `{len(pk)}` chars")
-                st.write(f"**Has BEGIN header:** `{'✅' if '-----BEGIN' in pk else '❌ NO'}`")
-                st.write(f"**Has END footer:** `{'✅' if '-----END' in pk else '❌ NO'}`")
-                st.write(f"**Has real newlines:** `{'✅' if chr(10) in pk else '⚠️ no (using \\\\n)'}`")
-            if len(pk) < 200:
-                st.error(f"❌ Private key is only {len(pk)} characters — it is TRUNCATED. "
-                         "The full key must be ~1600+ characters.")
-            else:
-                st.success(f"✅ Private key length looks OK ({len(pk)} chars)")
-            try:
-                cleaned = _clean_private_key(pk)
-                st.success("✅ Key can be cleaned/repaired successfully by the app")
-            except Exception as ke:
-                st.error(f"❌ Key repair failed: {ke}")
-    except Exception as ex:
-        st.error(f"Cannot read secrets at all: {ex}")
-
-    st.markdown("---")
+        st.markdown("After saving Secrets, click **Reboot app** and wait ~30 seconds.")
     if st.button("🔄 Retry connection now", type="primary"):
         _cached_client.clear()
         st.rerun()
-
-
-# IMPORTANT NOTE about the missing code block below:
-# The page_credential_error function above replaces the old one.
-# The old version had this at the end:
-def _placeholder_for_old_code():
-    st.code("""
-1. Go to https://console.cloud.google.com
-2. IAM & Admin → Service Accounts
-3. Click your service account
-4. Keys tab → DELETE the old key → Add Key → Create new key → JSON
-5. Download the new JSON file
-""", language="text")
-
-    st.markdown("#### Step 2 — Convert it correctly")
-    st.info("Use the converter at the bottom of this page OR follow the manual format below.")
-
-    st.markdown("#### Step 3 — Paste into Streamlit Cloud Secrets")
-    st.code("""
-Go to: share.streamlit.io → your app → ⋮ → Settings → Secrets
-DELETE everything in the box, then paste:
-
-[gcp_service_account]
-type                        = "service_account"
-project_id                  = "YOUR_PROJECT_ID"
-private_key_id              = "YOUR_KEY_ID"
-private_key                 = "-----BEGIN PRIVATE KEY-----\\nALL_KEY_BODY_ON_ONE_LINE_HERE\\n-----END PRIVATE KEY-----\\n"
-client_email                = "YOUR_BOT@YOUR_PROJECT.iam.gserviceaccount.com"
-client_id                   = "YOUR_CLIENT_ID"
-auth_uri                    = "https://accounts.google.com/o/oauth2/auth"
-token_uri                   = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url        = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_BOT..."
-universe_domain             = "googleapis.com"
-""", language="toml")
-
-    st.warning("⚠️ The `private_key` must be ONE single line inside the quotes, with `\\n` as literal backslash-n — NOT real newlines.")
-
-    with st.expander("🔍 Debug info — what the app sees in your secrets"):
-        try:
-            raw = dict(st.secrets["gcp_service_account"])
-            pk = str(raw.get("private_key", "NOT FOUND"))
-            st.write(f"**project_id:** `{raw.get('project_id','—')}`")
-            st.write(f"**client_email:** `{raw.get('client_email','—')}`")
-            st.write(f"**private_key_id:** `{raw.get('private_key_id','—')}`")
-            st.write(f"**private_key first 60 chars:** `{pk[:60]}`")
-            st.write(f"**private_key last 40 chars:** `{pk[-40:]}`")
-            st.write(f"**private_key length:** `{len(pk)}` characters")
-            has_begin = "-----BEGIN PRIVATE KEY-----" in pk
-            has_end   = "-----END PRIVATE KEY-----" in pk
-            has_real_newline = "\n" in pk
-            has_literal_n    = "\\n" in pk
-            st.write(f"**Has BEGIN header:** `{has_begin}`")
-            st.write(f"**Has END footer:** `{has_end}`")
-            st.write(f"**Has real newlines (good):** `{has_real_newline}`")
-            st.write(f"**Has literal \\\\n (also OK):** `{has_literal_n}`")
-            cleaned = _clean_private_key(pk)
-            lines = cleaned.split("\n")
-            st.write(f"**After cleaning — line count:** `{len(lines)}`")
-            st.write(f"**After cleaning — first line:** `{lines[0]}`")
-            st.write(f"**After cleaning — last line:** `{lines[-2] if len(lines)>1 else lines[-1]}`")
-        except Exception as ex:
-            st.error(f"Cannot read secrets: {ex}")
-
-    st.divider()
-    st.markdown(f"**Raw error:** `{err_msg}`")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -396,11 +227,14 @@ TAB = {
     "trips":            "Trips",
 }
 
+# FIX #1: Added "Email" to user_registry headers
+# FIX #6: Added "Mail ID" to admin_log headers
+# FIX #3: Added "Latitude" and "Longitude" to customer_onboard headers
 HEADERS = {
     "base": [
         "Order ID","SOID","City","ORDER DATE","DELIVERED DATE","ORDERED TIME",
         "CustomerId","Customer shop name","Customer Number","Customer_Classification",
-        "sales executive","sales executive Number","SKU","WeightType","Price",
+        "sales executive","sales executive Number","SKU","SKU Name","WeightType","Price",
         "OrderedQty","OrderTotal","ReturnQty","Reason","return_updated_role",
         "Tripid","Transport","ShopOpeningFrom","ShopReachTime","DeliveryCutOff",
         "Shop Location","Delivery Status","EnteredBy_UID","Timestamp",
@@ -408,16 +242,19 @@ HEADERS = {
     "customer_onboard": [
         "CUST-ID","Full Name","Mobile","Email","Shop Name","Shop Address",
         "City","Classification","Onboarded By","Onboard Date","Status",
+        "Latitude","Longitude",  # FIX #3
     ],
     "driver_onboard": [
         "Driver ID","Full Name","Mobile","Email","Vehicle Type",
         "Bank Name","Account Number","IFSC Code","UPI ID",
         "Onboard Date","Active Status","Last Active",
     ],
-    "user_registry": ["UID","Full Name","Phone","Role","Password Hash","Created At","Status"],
-    "sales_exec":    ["UID","Full Name","Phone","Role","Password Hash","Created At"],
-    "delivery_driver":["UID","Full Name","Phone","Role","Password Hash","Created At"],
-    "admin_log": ["Log ID","Timestamp","Admin UID","Action Type",
+    # FIX #1: Added "Email" and "Mail ID" columns; plain password (no hash label)
+    "user_registry": ["UID","Full Name","Phone","Email","Role","Password","Created At","Status"],
+    "sales_exec":    ["UID","Full Name","Phone","Email","Role","Password","Created At"],
+    "delivery_driver":["UID","Full Name","Phone","Email","Role","Password","Created At"],
+    # FIX #6: Added "Mail ID" to admin_log
+    "admin_log": ["Log ID","Timestamp","Admin UID","Mail ID","Action Type",
                   "Entity","Entity ID","Old Value","New Value","Notes"],
     "skus":  ["SKU Code","SKU Name","Price","Weight Type","Category","Active","Created By","Created At"],
     "trips": ["Trip ID","Date","City","Shops","Driver UID","Driver Name","Status","Created By","Created At"],
@@ -425,41 +262,16 @@ HEADERS = {
 
 
 def open_spreadsheet():
-    """
-    Open the Google Sheet by name.
-    NEVER auto-creates — avoids the 403 Drive quota error.
-    The sheet must exist and be shared with the service account as Editor.
-    """
     client = get_gspread_client()
     try:
         return client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        # Do NOT call client.create() — it causes 403 Drive quota errors
-        # and fails if the service account has no Drive storage quota.
-        # Instead, show clear instructions and stop.
         st.markdown(f"""
 <div style="background:#fff3cd;border:2px solid #e8a020;border-radius:14px;padding:20px;margin:10px 0">
 <h3 style="color:#854f0b;margin:0 0 10px">📋 Google Sheet Not Found</h3>
 <p style="color:#5a4010;margin:0 0 12px">
-The app cannot find a sheet named <strong>"{SPREADSHEET_NAME}"</strong>
-in the Google Drive of your service account.<br>
-This is a <strong>one-time setup step</strong> — takes 2 minutes.
+Create a sheet named <strong>"{SPREADSHEET_NAME}"</strong> and share it with your service account as Editor.
 </p>
-<hr style="border-color:#e8a020;margin:12px 0">
-<p style="color:#5a4010;margin:0 0 6px"><strong>Step 1 — Create the sheet:</strong></p>
-<ol style="color:#5a4010;margin:0 0 12px;padding-left:18px">
-<li>Go to <a href="https://sheets.google.com" target="_blank">sheets.google.com</a></li>
-<li>Click <strong>+ Blank spreadsheet</strong></li>
-<li>Rename it exactly to: <code style="background:#fff;padding:2px 6px;border-radius:4px">Garlic_Order &amp; Delivery Project</code></li>
-</ol>
-<p style="color:#5a4010;margin:0 0 6px"><strong>Step 2 — Share it with your service account:</strong></p>
-<ol style="color:#5a4010;margin:0 0 12px;padding-left:18px">
-<li>Click <strong>Share</strong> button (top right of the sheet)</li>
-<li>Paste the <code>client_email</code> from your credentials JSON</li>
-<li>Set permission to <strong>Editor</strong></li>
-<li>Click <strong>Send</strong></li>
-</ol>
-<p style="color:#5a4010;margin:0"><strong>Step 3 — Reboot this app</strong> and the error will be gone ✅</p>
 </div>
 """, unsafe_allow_html=True)
         st.stop()
@@ -544,16 +356,16 @@ def get_driver_trip(driver_uid: str):
            (df["Status"].astype(str).str.lower().isin(["assigned","in progress"]))]
     return m.iloc[0].to_dict() if not m.empty else None
 
-def write_admin_log(admin_uid, action, entity, entity_id, old="", new="", notes=""):
+# FIX #6: write_admin_log now accepts and stores mail_id
+def write_admin_log(admin_uid, mail_id, action, entity, entity_id, old="", new="", notes=""):
     lid = "LOG-" + uuid.uuid4().hex[:6].upper()
     ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    append_row("admin_log", [lid, ts, admin_uid, action, entity,
+    append_row("admin_log", [lid, ts, admin_uid, mail_id, action, entity,
                               str(entity_id), str(old), str(new), notes])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AUTH
+#  AUTH  — FIX #1: password stored plain text, login by email (mail id)
 # ═══════════════════════════════════════════════════════════════════════════════
-def hash_pw(pw):   return hashlib.sha256(pw.encode()).hexdigest()
 def gen_uid(role):
     p = {"admin":"ADMIN","sales executive":"SE","delivery Driver":"DD"}.get(role,"USR")
     return f"{p}-{uuid.uuid4().hex[:6].upper()}"
@@ -561,28 +373,34 @@ def gen_cust_id():  return f"CUST-{uuid.uuid4().hex[:6].upper()}"
 def gen_driver_id():return f"DD-{uuid.uuid4().hex[:6].upper()}"
 def gen_order_id(): return f"ORD-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
 
-def register_user(name, phone, role, password):
+# FIX #1: register stores email; password stored as plain text (no hashing)
+def register_user(name, phone, email, role, password):
     if col_exists("user_registry","Phone", phone):
         ex = find_row("user_registry","Phone", phone)
         return None, f"Phone already registered. UID: {ex['UID']}"
+    if email and col_exists("user_registry","Email", email):
+        ex = find_row("user_registry","Email", email)
+        return None, f"Email already registered. UID: {ex['UID']}"
     uid  = gen_uid(role)
-    pw_h = hash_pw(password)
     ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    append_row("user_registry",[uid, name, phone, role, pw_h, ts, "Active"])
+    # Store password as plain text per requirement
+    append_row("user_registry",[uid, name, phone, email, role, password, ts, "Active"])
     if role in ("sales executive","delivery Driver"):
         rk = "sales_exec" if role == "sales executive" else "delivery_driver"
-        append_row(rk,[uid, name, phone, role, pw_h, ts])
+        append_row(rk,[uid, name, phone, email, role, password, ts])
     return uid, None
 
-def login_user(phone, password):
-    user = find_row("user_registry","Phone", phone)
-    if not user:        return None, "Phone number not found."
-    if user.get("Password Hash") != hash_pw(password):
+# FIX #1: login_user uses Email (mail id) as login identifier
+def login_user(email, password):
+    user = find_row("user_registry","Email", email)
+    if not user:        return None, "Email not found."
+    if str(user.get("Password","")) != str(password):
         return None, "Incorrect password."
     if str(user.get("Status","")).lower() != "active":
         return None, "Account inactive. Contact admin."
     return {"uid":user["UID"],"name":user["Full Name"],
-            "role":user["Role"],"phone":user["Phone"]}, None
+            "role":user["Role"],"phone":user["Phone"],
+            "email":user["Email"]}, None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI HELPERS
@@ -602,6 +420,7 @@ def map_embed(address, height=260):
             f' src="https://maps.google.com/maps?q={enc}&output=embed&z=15">'
             f'</iframe></div>')
 
+# FIX #11: Logout only allowed after tasks done (task_done flag)
 def topbar(role_label, role_color="#1a7f4b"):
     user = st.session_state.user
     c1,c2,c3 = st.columns([5,3,2])
@@ -620,16 +439,23 @@ def topbar(role_label, role_color="#1a7f4b"):
             f'&nbsp;<code style="font-size:.72rem;color:#5a7a65">{user["uid"]}</code>'
             f'</div>', unsafe_allow_html=True)
     with c3:
-        if st.button("🚪 Logout", key="topbar_logout"):
-            if user["role"] == "delivery Driver":
-                dr = find_row("driver_onboard","Mobile", user["phone"])
-                if dr: set_driver_status(dr["Driver ID"],"Offline")
-            for k in DEFAULTS: st.session_state[k] = DEFAULTS[k]
-            st.rerun()
+        # FIX #11: only show logout when task_done is True
+        if st.session_state.get("task_done", False):
+            if st.button("🚪 Logout", key="topbar_logout"):
+                if user["role"] == "delivery Driver":
+                    dr = find_row("driver_onboard","Mobile", user["phone"])
+                    if dr: set_driver_status(dr["Driver ID"],"Offline")
+                for k in DEFAULTS: st.session_state[k] = DEFAULTS[k]
+                st.rerun()
+        else:
+            st.markdown(
+                '<div style="text-align:right;padding-top:10px">'
+                '<span style="color:#5a7a65;font-size:.8rem">🔒 Complete tasks to logout</span>'
+                '</div>', unsafe_allow_html=True)
     st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PAGE: LOGIN & REGISTER
+#  PAGE: LOGIN & REGISTER — FIX #1 (email login) + FIX #5 (admin register gate)
 # ═══════════════════════════════════════════════════════════════════════════════
 def page_login():
     st.markdown("""
@@ -647,20 +473,22 @@ def page_login():
     with col:
         tab_lg, tab_rg = st.tabs(["🔐  Login","📝  Register"])
 
+        # FIX #1: Login by email (mail id)
         with tab_lg:
-            phone = st.text_input("Phone number", placeholder="Registered phone", key="lg_ph")
+            email = st.text_input("Email (Login ID)", placeholder="you@example.com", key="lg_email")
             pw    = st.text_input("Password", type="password", key="lg_pw")
             if st.button("Login →", type="primary", use_container_width=True, key="lg_btn"):
-                if not phone or not pw:
-                    st.error("Enter phone and password.")
+                if not email or not pw:
+                    st.error("Enter email and password.")
                 else:
                     with st.spinner("Verifying…"):
-                        user, err = login_user(phone, pw)
+                        user, err = login_user(email.strip().lower(), pw)
                     if err:
                         st.error(f"❌ {err}")
                     else:
                         st.session_state.logged_in = True
                         st.session_state.user      = user
+                        st.session_state.task_done = False  # FIX #11
                         if user["role"] == "delivery Driver":
                             dr = find_row("driver_onboard","Mobile", user["phone"])
                             if dr:
@@ -668,36 +496,55 @@ def page_login():
                                 st.session_state.driver_id = dr["Driver ID"]
                         st.rerun()
 
+        # FIX #1 + FIX #5: Register stores email; admin role requires gate password
         with tab_rg:
             rn   = st.text_input("Full name", key="rg_name")
             rph  = st.text_input("Phone number", key="rg_ph")
+            # FIX #1: email is the login id
+            rem  = st.text_input("Email (will be your Login ID) *", placeholder="you@example.com", key="rg_email")
             rrol = st.selectbox("Role",["sales executive","delivery Driver","admin"], key="rg_role")
             rpw  = st.text_input("Password", type="password", key="rg_pw")
             rpw2 = st.text_input("Confirm password", type="password", key="rg_pw2")
+
+            # FIX #5: Show admin gate password field only when admin selected
+            admin_gate = ""
+            if rrol == "admin":
+                admin_gate = st.text_input("Admin Registration Password *",
+                                           type="password", key="rg_admin_gate",
+                                           help="Only admin can register. Contact system admin for this password.")
+
             if st.button("Create account →", type="primary", use_container_width=True, key="rg_btn"):
-                if not all([rn,rph,rpw,rpw2]):
+                if not all([rn,rph,rem,rpw,rpw2]):
                     st.error("Fill in all fields.")
                 elif rpw != rpw2:
                     st.error("Passwords do not match.")
                 elif len(rpw) < 6:
                     st.error("Password min 6 characters.")
+                elif not rem or "@" not in rem:
+                    st.error("Enter a valid email address.")
+                # FIX #5: gate admin registration with password
+                elif rrol == "admin" and admin_gate != ADMIN_REGISTER_PASSWORD:
+                    st.error("❌ Invalid admin registration password. Contact system admin.")
                 else:
                     with st.spinner("Creating account…"):
-                        uid, err = register_user(rn, rph, rrol, rpw)
+                        uid, err = register_user(rn, rph, rem.strip().lower(), rrol, rpw)
                     if err:
                         st.error(f"❌ {err}")
                     else:
                         st.success("✅ Account created!")
-                        st.info(f"Your permanent UID: **`{uid}`** — save this.")
+                        st.info(f"Your permanent UID: **`{uid}`** — save this. Login with your email.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PAGE: ADMIN
+#  PAGE: ADMIN — All fixes: #6 (log mail id), #7 (shop loc auto), #8 (driver onboard tab),
+#                            #9 (multi-shop trips), #10 (assign driver fix), #11 (task done)
 # ═══════════════════════════════════════════════════════════════════════════════
 def page_admin():
     user = st.session_state.user
     topbar("🛡️ Admin","#185fa5")
+
+    # FIX #8: Added "🚗 Driver Onboard" tab in admin page
     tabs = st.tabs(["📦 SKUs","🗺️ Trips","🚚 Assign Drivers",
-                    "👤 Customers","🚗 Drivers","📋 Orders","📝 Audit Log"])
+                    "👤 Customers","🚗 Driver Onboard","📋 Orders","📝 Audit Log"])
 
     with tabs[0]:   # SKU management
         st.markdown(sl("📦 SKU Master"), unsafe_allow_html=True)
@@ -731,8 +578,10 @@ def page_admin():
                                        sk_cat or "General","true",
                                        user["uid"],str(date.today())])
                     load_skus.clear()
-                    write_admin_log(user["uid"],"ADD SKU","SKU",sk_code,"","",sk_name)
+                    # FIX #6: pass email to write_admin_log
+                    write_admin_log(user["uid"],user.get("email",""),"ADD SKU","SKU",sk_code,"","",sk_name)
                     st.success(f"SKU **{sk_code}** added!")
+                    st.session_state.task_done = True  # FIX #11
                     st.rerun()
 
         st.markdown("#### All SKUs")
@@ -753,13 +602,15 @@ def page_admin():
                 if c5.button("Disable" if is_act else "Enable", key=f"skt{idx}"):
                     update_row("skus","SKU Code",row["SKU Code"],
                                {"Active":"false" if is_act else "true","Price":new_p})
-                    write_admin_log(user["uid"],("Disable" if is_act else "Enable")+" SKU",
+                    write_admin_log(user["uid"],user.get("email",""),
+                                    ("Disable" if is_act else "Enable")+" SKU",
                                     "SKU",row["SKU Code"],row["Price"],new_p)
                     load_skus.clear()
+                    st.session_state.task_done = True  # FIX #11
                     st.rerun()
                 st.divider()
 
-    with tabs[1]:   # Trips
+    with tabs[1]:   # Trips — FIX #9: multi-shop assignment with Trip ID
         st.markdown(sl("🗺️ Trips & Routes"), unsafe_allow_html=True)
         with st.expander("➕ Create new trip"):
             tc1,tc2 = st.columns(2)
@@ -770,11 +621,17 @@ def page_admin():
                 tr_city = st.selectbox("City",["Bengaluru","Mysuru","Hubli","Mangaluru"], key="tr_city")
             custs_df = load_customers()
             if not custs_df.empty:
+                # FIX #9: multiselect allows many shops per trip
                 shop_opts = custs_df.apply(
                     lambda r: f"{r['CUST-ID']} — {r['Shop Name']} ({r['City']})", axis=1).tolist()
                 cust_ids  = custs_df["CUST-ID"].tolist()
-                sel_shops = st.multiselect("Select shops *", shop_opts, key="tr_shops")
-                sel_ids   = [cust_ids[shop_opts.index(s)] for s in sel_shops]
+                sel_shops = st.multiselect(
+                    "Select shops * (you can add multiple shops to one trip)",
+                    shop_opts, key="tr_shops",
+                    help="Select as many shops as needed for this trip")
+                sel_ids = [cust_ids[shop_opts.index(s)] for s in sel_shops]
+                if sel_ids:
+                    st.info(f"✅ {len(sel_ids)} shop(s) selected for this trip: {', '.join(sel_ids)}")
             else:
                 st.warning("No customers onboarded yet.")
                 sel_ids = []
@@ -784,58 +641,81 @@ def page_admin():
                 elif col_exists("trips","Trip ID", tr_id):
                     st.error("Trip ID already exists.")
                 else:
+                    # FIX #9: store all shop IDs comma-separated
                     append_row("trips",[tr_id,str(tr_date),tr_city,",".join(sel_ids),
                                         "","","Assigned",user["uid"],
                                         datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                    write_admin_log(user["uid"],"CREATE TRIP","Trip",tr_id,"","",f"{len(sel_ids)} shops")
+                    write_admin_log(user["uid"],user.get("email",""),
+                                    "CREATE TRIP","Trip",tr_id,"","",f"{len(sel_ids)} shops")
                     st.success(f"Trip **{tr_id}** created with {len(sel_ids)} shop(s)!")
+                    st.session_state.task_done = True  # FIX #11
                     st.rerun()
+
         trips_df = read_sheet("trips")
         if not trips_df.empty:
-            st.dataframe(trips_df, use_container_width=True, hide_index=True)
+            # Show shop count per trip for clarity
+            def shop_count(shops_str):
+                ids = [s.strip() for s in str(shops_str).split(",") if s.strip()]
+                return len(ids)
+            trips_disp = trips_df.copy()
+            trips_disp["Shop Count"] = trips_disp["Shops"].apply(shop_count)
+            st.dataframe(trips_disp, use_container_width=True, hide_index=True)
         else:
             st.info("No trips yet.")
 
-    with tabs[2]:   # Assign drivers
+    with tabs[2]:   # Assign drivers — FIX #10: show ALL trips (not just unassigned)
         st.markdown(sl("🚚 Active Drivers & Assignment"), unsafe_allow_html=True)
+
+        # Show ALL drivers (active + offline) — FIX #10
+        all_drivers_df = read_sheet("driver_onboard")
         act_df = active_drivers()
-        if act_df.empty:
-            st.warning("🔴 No drivers online. Drivers go Active when they log in.")
+
+        if all_drivers_df.empty:
+            st.warning("No drivers onboarded yet. Onboard drivers in the 'Driver Onboard' tab.")
         else:
-            st.success(f"🟢 {len(act_df)} driver(s) currently active")
-            for _,r in act_df.iterrows():
-                c1,c2,c3 = st.columns([2,2,2])
+            st.success(f"🟢 {len(act_df)} active · ⚫ {len(all_drivers_df)-len(act_df)} offline")
+            for _,r in all_drivers_df.iterrows():
+                is_on = str(r.get("Active Status","")).lower() == "active"
+                c1,c2,c3,c4 = st.columns([2,2,2,1])
                 c1.markdown(f"**{r['Full Name']}**")
                 c2.write(f"`{r['Driver ID']}` · {r.get('Vehicle Type','')}")
-                c3.write(f"Since: {r.get('Last Active','')}")
+                c3.write(f"Last active: {r.get('Last Active','')}")
+                c4.markdown(pill("Active","pill-on") if is_on else pill("Offline","pill-off"),
+                            unsafe_allow_html=True)
+
         st.divider()
         trips_df = read_sheet("trips")
-        if trips_df.empty or act_df.empty:
-            st.info("Create trips and wait for active drivers to assign.")
+        if trips_df.empty:
+            st.info("No trips created yet.")
+        elif all_drivers_df.empty:
+            st.info("No drivers available to assign.")
         else:
-            unassigned = trips_df[trips_df["Driver UID"].astype(str).str.strip()==""]
-            if unassigned.empty:
-                st.info("All trips have drivers assigned.")
-            else:
-                ac1,ac2 = st.columns(2)
-                with ac1:
-                    sel_trip = st.selectbox("Select trip", unassigned["Trip ID"].tolist(), key="asgn_trip")
-                    if sel_trip:
-                        t = unassigned[unassigned["Trip ID"]==sel_trip].iloc[0]
-                        n = len([s for s in str(t.get("Shops","")).split(",") if s.strip()])
-                        st.caption(f"📦 {n} shops · {t['City']} · {t['Date']}")
-                with ac2:
-                    drv_opts = act_df.apply(lambda r: f"{r['Full Name']} ({r['Driver ID']})", axis=1).tolist()
-                    drv_ids  = act_df["Driver ID"].tolist()
-                    sel_lbl  = st.selectbox("Select driver", drv_opts, key="asgn_drv")
-                    sel_id   = drv_ids[drv_opts.index(sel_lbl)] if sel_lbl else ""
-                    drv_name = act_df[act_df["Driver ID"]==sel_id]["Full Name"].values[0] if sel_id else ""
-                if st.button("✅ Assign Driver", type="primary", key="asgn_btn"):
-                    update_row("trips","Trip ID",sel_trip,
-                               {"Driver UID":sel_id,"Driver Name":drv_name,"Status":"Assigned"})
-                    write_admin_log(user["uid"],"ASSIGN DRIVER","Trip",sel_trip,"",sel_id,drv_name)
-                    st.success(f"**{drv_name}** assigned to **{sel_trip}**!")
-                    st.rerun()
+            # FIX #10: show ALL trips, not just unassigned
+            st.markdown("#### Assign / Reassign Driver to Trip")
+            ac1,ac2 = st.columns(2)
+            with ac1:
+                sel_trip = st.selectbox("Select trip", trips_df["Trip ID"].tolist(), key="asgn_trip")
+                if sel_trip:
+                    t = trips_df[trips_df["Trip ID"]==sel_trip].iloc[0]
+                    shop_ids_t = [s.strip() for s in str(t.get("Shops","")).split(",") if s.strip()]
+                    current_drv = t.get("Driver Name","") or "None"
+                    st.caption(f"📦 {len(shop_ids_t)} shops · {t['City']} · {t['Date']} · Current driver: **{current_drv}**")
+            with ac2:
+                # FIX #10: use ALL drivers for assignment, not just active
+                drv_opts = all_drivers_df.apply(
+                    lambda r: f"{r['Full Name']} ({r['Driver ID']}) — {r.get('Active Status','')}", axis=1).tolist()
+                drv_ids  = all_drivers_df["Driver ID"].tolist()
+                sel_lbl  = st.selectbox("Select driver", drv_opts, key="asgn_drv")
+                sel_id   = drv_ids[drv_opts.index(sel_lbl)] if sel_lbl else ""
+                drv_name = all_drivers_df[all_drivers_df["Driver ID"]==sel_id]["Full Name"].values[0] if sel_id else ""
+            if st.button("✅ Assign Driver", type="primary", key="asgn_btn"):
+                update_row("trips","Trip ID",sel_trip,
+                           {"Driver UID":sel_id,"Driver Name":drv_name,"Status":"Assigned"})
+                write_admin_log(user["uid"],user.get("email",""),
+                                "ASSIGN DRIVER","Trip",sel_trip,"",sel_id,drv_name)
+                st.success(f"**{drv_name}** assigned to **{sel_trip}**!")
+                st.session_state.task_done = True  # FIX #11
+                st.rerun()
 
     with tabs[3]:   # Customers
         st.markdown(sl("👤 Customer Onboard Data"), unsafe_allow_html=True)
@@ -849,8 +729,64 @@ def page_admin():
             c3.metric("Cities", df_c["City"].nunique())
             st.dataframe(df_c, use_container_width=True, hide_index=True)
 
-    with tabs[4]:   # Drivers
-        st.markdown(sl("🚗 Driver Onboard Data","amber"), unsafe_allow_html=True)
+    # FIX #8: Driver Onboard tab moved to admin page
+    with tabs[4]:
+        st.markdown(sl("🚗 Driver Onboard","amber"), unsafe_allow_html=True)
+        # Search existing
+        ds1,ds2 = st.columns([3,1])
+        with ds1: do_sv = st.text_input("Search existing driver by mobile", key="adm_do_search")
+        with ds2:
+            st.write(""); st.write("")
+            do_dos = st.button("🔍 Search", key="adm_do_search_btn")
+        if do_dos and do_sv:
+            ex = find_row("driver_onboard","Mobile", do_sv.strip())
+            if ex:
+                acct = str(ex.get("Account Number",""))
+                masked = ("*"*(len(acct)-4)+acct[-4:]) if len(acct)>4 else "****"
+                st.success(f"✅ Already onboarded — Driver ID: **{ex['Driver ID']}**")
+                st.json({"Name":ex.get("Full Name"),"Vehicle":ex.get("Vehicle Type"),
+                         "Bank":ex.get("Bank Name"),"Account":masked,
+                         "Status":ex.get("Active Status")})
+            else:
+                st.info("Not found — fill form below.")
+        st.divider()
+        st.markdown("#### Onboard New Driver")
+        dn1,dn2,dn3 = st.columns(3)
+        with dn1:
+            do_name  = st.text_input("Full name *",       key="adm_do_name")
+            do_mob   = st.text_input("Mobile *",          placeholder="10-digit", key="adm_do_mob")
+            do_email = st.text_input("Email",             key="adm_do_email")
+        with dn2:
+            do_veh   = st.selectbox("Vehicle type",["Bike","Auto","Van","Truck","Mini-Truck"], key="adm_do_veh")
+            do_bank  = st.text_input("Bank name *",       key="adm_do_bank")
+            do_acct  = st.text_input("Account number *",  key="adm_do_acct")
+        with dn3:
+            do_ifsc  = st.text_input("IFSC code *",       key="adm_do_ifsc")
+            do_upi   = st.text_input("UPI ID",            placeholder="mobile@upi", key="adm_do_upi")
+        st.caption("🔒 Bank details stored securely, visible to admin only.")
+        if st.button("✅ Onboard Driver", type="primary", use_container_width=True, key="adm_do_btn"):
+            if not all([do_name,do_mob,do_bank,do_acct,do_ifsc]):
+                st.error("Fill all required (*) fields.")
+            else:
+                with st.spinner("Checking duplicates…"):
+                    ex = find_row("driver_onboard","Mobile", do_mob.strip())
+                if ex:
+                    st.warning(f"⚠️ Mobile already registered — Driver ID: **{ex['Driver ID']}**")
+                else:
+                    did = gen_driver_id()
+                    append_row("driver_onboard",[
+                        did,do_name,do_mob,do_email,do_veh,
+                        do_bank,do_acct,do_ifsc,do_upi,
+                        str(date.today()),"Offline","",
+                    ])
+                    write_admin_log(user["uid"],user.get("email",""),
+                                    "ONBOARD DRIVER","Driver",did,"","",do_name)
+                    st.success(f"✅ Driver onboarded! Driver ID: **`{did}`**")
+                    st.session_state.task_done = True  # FIX #11
+                    st.balloons()
+
+        st.divider()
+        st.markdown("#### All Drivers")
         df_d = read_sheet("driver_onboard")
         if df_d.empty:
             st.info("No drivers onboarded yet.")
@@ -878,7 +814,7 @@ def page_admin():
             c4.metric("Failed/Partial", len(df_o[df_o["Delivery Status"].isin(["Failed","Partial"])]))
             st.dataframe(df_o, use_container_width=True, hide_index=True)
 
-    with tabs[6]:   # Audit log
+    with tabs[6]:   # Audit log — FIX #6: mail id column visible
         st.markdown(sl("📝 Admin Audit Log","blue"), unsafe_allow_html=True)
         df_l = read_sheet("admin_log")
         if df_l.empty:
@@ -887,8 +823,18 @@ def page_admin():
             st.dataframe(df_l.sort_values("Timestamp",ascending=False),
                          use_container_width=True, hide_index=True)
 
+    # FIX #11: Admin can mark tasks done to enable logout
+    st.divider()
+    if not st.session_state.get("task_done", False):
+        if st.button("✅ Mark All Tasks Done (enables Logout)", key="admin_tasks_done"):
+            st.session_state.task_done = True
+            st.rerun()
+    else:
+        st.success("✅ Tasks marked complete — Logout button is now active above.")
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PAGE: SALES EXECUTIVE (T1)
+#  PAGE: SALES EXECUTIVE — FIX #2 (auto order time), #3 (lat/long),
+#                           #4 (SKU name dropdown + order total), #7 (shop loc auto)
 # ═══════════════════════════════════════════════════════════════════════════════
 def page_sales():
     user = st.session_state.user
@@ -925,7 +871,8 @@ def page_sales():
             cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
             ci = cities.index(cust.get("City","Bengaluru")) if cust.get("City") in cities else 0
             o_city  = st.selectbox("City *", cities, index=ci, key="o_city")
-            o_time  = st.time_input("Ordered time", value=datetime.now().time(), key="o_time")
+            # FIX #2: Order time auto-populates with current time
+            o_time  = st.time_input("Ordered time (auto)", value=datetime.now().time(), key="o_time")
         with oc3:
             o_dcoff = st.time_input("Delivery cut-off", key="o_dcoff")
             o_sopen = st.time_input("Shop opens at",    key="o_sopen")
@@ -949,8 +896,14 @@ def page_sales():
         else:
             sc1,sc2,sc3 = st.columns(3)
             with sc1:
-                sel_sku = st.selectbox("SKU *", df_sku["SKU Code"].tolist(), key="o_sku")
-                sku_row = df_sku[df_sku["SKU Code"]==sel_sku].iloc[0]
+                # FIX #4: Show "SKU NAME — SKU Code" in dropdown
+                sku_display_opts = df_sku.apply(
+                    lambda r: f"{r['SKU Name']}  [{r['SKU Code']}]", axis=1).tolist()
+                sku_codes = df_sku["SKU Code"].tolist()
+                sel_disp = st.selectbox("SKU / Product *", sku_display_opts, key="o_sku_disp")
+                sel_sku  = sku_codes[sku_display_opts.index(sel_disp)]
+                sku_row  = df_sku[df_sku["SKU Code"]==sel_sku].iloc[0]
+                st.caption(f"SKU Code: `{sel_sku}`")
             with sc2:
                 sku_price = float(str(sku_row["Price"]).replace("₹","").replace(",","") or 0)
                 sku_wt    = str(sku_row["Weight Type"])
@@ -958,11 +911,21 @@ def page_sales():
                 st.text_input("Weight type", value=sku_wt, disabled=True, key="o_wt")
             with sc3:
                 o_qty   = st.number_input("Ordered qty *", min_value=0.0, step=0.5, key="o_qty")
+                # FIX #4: Order total calculated live = qty * unit price
                 o_total = sku_price * o_qty
-                st.text_input("Order total ₹", value=f"₹{o_total:,.2f}", disabled=True, key="o_total")
+                st.text_input("Order total ₹ (Qty × Price)", value=f"₹{o_total:,.2f}",
+                              disabled=True, key="o_total",
+                              help="Auto-calculated: Ordered Qty × Unit Price (admin rate)")
+                if o_qty > 0:
+                    st.caption(f"📊 {o_qty} × ₹{sku_price:.2f} = **₹{o_total:,.2f}**")
 
             st.markdown(sl("📍 Shop Location"), unsafe_allow_html=True)
-            o_addr = st.text_input("Shop address *", value=cust.get("Shop Address",""), key="o_addr")
+            # FIX #7: Auto-populate shop address from Customer Onboard Data
+            auto_addr = cust.get("Shop Address","")
+            o_addr = st.text_input("Shop address *", value=auto_addr, key="o_addr",
+                                   help="Auto-filled from Customer Onboard Data based on Customer ID")
+            if auto_addr and o_addr == auto_addr:
+                st.caption("📍 Address auto-loaded from Customer Onboard Data")
             if o_addr:
                 st.markdown(map_embed(o_addr, 240), unsafe_allow_html=True)
                 st.caption("📍 Verify the pin matches the shop before submitting.")
@@ -977,12 +940,14 @@ def page_sales():
                     st.error("Shop address required.")
                 else:
                     soid = "SO-" + o_id.replace("ORD-","")
+                    # FIX #2: capture ordered time automatically at submission moment
+                    ordered_time = datetime.now().strftime("%H:%M:%S")
                     append_row("base",[
-                        o_id, soid, o_city, str(o_date),"",str(o_time),
+                        o_id, soid, o_city, str(o_date),"",ordered_time,
                         cust.get("CUST-ID",""), cust.get("Shop Name",""),
                         cust.get("Mobile",""),  cust.get("Classification",""),
                         user["name"], user["uid"],
-                        sel_sku, sku_wt, sku_price, o_qty, o_total,
+                        sel_sku, sku_row["SKU Name"], sku_wt, sku_price, o_qty, o_total,
                         0,"","","","",
                         str(o_sopen),"",str(o_dcoff),
                         o_addr,"Pending",user["uid"],
@@ -990,6 +955,7 @@ def page_sales():
                     ])
                     st.success(f"✅ Order **{o_id}** submitted! Total: **₹{o_total:,.2f}**")
                     st.session_state.cust_data = {}
+                    st.session_state.task_done = True  # FIX #11
                     st.balloons()
 
     with tabs[1]:
@@ -1022,11 +988,22 @@ def page_sales():
                 ["A","B","C","Premium","Wholesale","Retail"], key="co_cls")
         with nc3:
             co_addr  = st.text_input("Shop address *", placeholder="House/street/landmark…", key="co_addr")
+            # FIX #3: Latitude & Longitude fields for customer onboard
+            co_lat   = st.text_input("Latitude *", placeholder="e.g. 12.9716", key="co_lat",
+                                     help="GPS latitude of the shop location")
+            co_lng   = st.text_input("Longitude *", placeholder="e.g. 77.5946", key="co_lng",
+                                     help="GPS longitude of the shop location")
+
         if co_addr:
             st.markdown(map_embed(co_addr, 220), unsafe_allow_html=True)
+            if co_lat and co_lng:
+                st.caption(f"📍 Coordinates: {co_lat}, {co_lng}")
+
         if st.button("✅ Onboard Customer", type="primary", use_container_width=True, key="co_btn"):
             if not all([co_name,co_mob,co_shop,co_addr]):
                 st.error("Fill all required (*) fields.")
+            elif not co_lat or not co_lng:
+                st.error("Latitude and Longitude are required for customer onboarding.")
             else:
                 with st.spinner("Checking duplicates…"):
                     ex = find_row("customer_onboard","Mobile", co_mob.strip())
@@ -1034,13 +1011,16 @@ def page_sales():
                     st.warning(f"⚠️ Mobile already registered — CUST-ID: **{ex['CUST-ID']}**")
                 else:
                     cid = gen_cust_id()
+                    # FIX #3: store lat and long
                     append_row("customer_onboard",[
                         cid,co_name,co_mob,co_email,co_shop,
                         co_addr,co_city,co_cls,
                         user["uid"],str(date.today()),"Active",
+                        co_lat, co_lng,
                     ])
                     load_customers.clear()
                     st.success(f"✅ Onboarded! Permanent CUST-ID: **`{cid}`**")
+                    st.session_state.task_done = True  # FIX #11
                     st.balloons()
 
     with tabs[2]:
@@ -1060,19 +1040,30 @@ def page_sales():
                 mc2.metric("Pending",   len(my[my["Delivery Status"]=="Pending"]))
                 mc3.metric("Delivered", len(my[my["Delivery Status"]=="Delivered"]))
                 mc4.metric("Value",     f"₹{tot_val:,.0f}")
+                cols_show = [c for c in ["Order ID","Customer shop name","SKU","SKU Name",
+                             "OrderedQty","OrderTotal","ORDER DATE","Delivery Status"] if c in my.columns]
                 st.dataframe(
-                    my[["Order ID","Customer shop name","SKU","OrderedQty",
-                        "OrderTotal","ORDER DATE","Delivery Status"]
-                    ].sort_values("ORDER DATE",ascending=False),
+                    my[cols_show].sort_values("ORDER DATE",ascending=False),
                     use_container_width=True, hide_index=True)
 
+    # FIX #11: allow logout after tasks
+    st.divider()
+    if not st.session_state.get("task_done", False):
+        if st.button("✅ Mark All Tasks Done (enables Logout)", key="sales_tasks_done"):
+            st.session_state.task_done = True
+            st.rerun()
+    else:
+        st.success("✅ Tasks marked complete — Logout button is now active above.")
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PAGE: DELIVERY DRIVER (T2)
+#  PAGE: DELIVERY DRIVER — FIX #8 (removed Driver Onboard tab), #11 (task done)
+#                           FIX #7 (shop location auto from Customer Onboard Data)
 # ═══════════════════════════════════════════════════════════════════════════════
 def page_delivery():
     user = st.session_state.user
     topbar("🚚 Delivery Driver · T2","#854f0b")
-    tabs = st.tabs(["🗺️ My Route","📝 Driver Onboard","📦 History"])
+    # FIX #8: Removed "Driver Onboard" tab from driver login page
+    tabs = st.tabs(["🗺️ My Route","📦 History"])
 
     with tabs[0]:
         st.markdown(sl("🗺️ Route & Deliveries","amber"), unsafe_allow_html=True)
@@ -1091,6 +1082,7 @@ def page_delivery():
         if not trip:
             st.info("📋 No trip assigned. Contact admin to assign your route.")
             return
+        # FIX #9: parse all shops (comma-separated) in trip
         shop_ids = [s.strip() for s in str(trip.get("Shops","")).split(",") if s.strip()]
         st.info(f"**Trip:** {trip['Trip ID']} · **{trip['City']}** · **{trip['Date']}** · {len(shop_ids)} stops")
 
@@ -1128,11 +1120,20 @@ def page_delivery():
                 r1,r2 = st.columns([9,2])
                 with r1:
                     st.markdown(f"**{icon} Stop {i+1}** — {shop.get('Shop Name','') if shop else sid}")
-                    if shop:  st.caption(f"📍 {shop.get('Shop Address','')}")
-                    if order: st.caption(f"SKU: {order.get('SKU','')} · Qty: {order.get('OrderedQty','')} · ₹{order.get('OrderTotal','')}")
+                    # FIX #7: show auto-loaded shop location from Customer Onboard Data
+                    if shop:
+                        addr = shop.get("Shop Address","")
+                        lat  = shop.get("Latitude","")
+                        lng  = shop.get("Longitude","")
+                        st.caption(f"📍 {addr}")
+                        if lat and lng:
+                            st.caption(f"🌐 Lat: {lat}, Lng: {lng}")
+                    if order:
+                        st.caption(f"SKU: {order.get('SKU','')} · Qty: {order.get('OrderedQty','')} · ₹{order.get('OrderTotal','')}")
                 with r2:
                     st.markdown(pill(stat,p_cls), unsafe_allow_html=True)
             if is_cur and i <= active_idx:
+                # FIX #7: show map using address from Customer Onboard Data
                 addr = shop.get("Shop Address","") if shop else ""
                 if addr: st.markdown(map_embed(addr,200), unsafe_allow_html=True)
                 with st.form(key=f"del_form_{i}"):
@@ -1160,64 +1161,17 @@ def page_delivery():
                             "return_updated_role":"delivery Driver",
                         })
                     st.session_state.active_stop = i + 1
+                    st.session_state.task_done = True  # FIX #11
                     st.success(f"✅ Stop {i+1} marked **{d_status}**. "
-                               f"{'Next stop unlocked!' if i+1<len(shop_ids) else 'All done!'}")
+                               f"{'Next stop unlocked!' if i+1<len(shop_ids) else 'All stops done!'}")
                     st.rerun()
             st.divider()
         if active_idx >= len(shop_ids):
             st.success("🎉 All stops completed! Trip finished.")
             update_row("trips","Trip ID",trip["Trip ID"],{"Status":"Completed"})
+            st.session_state.task_done = True  # FIX #11
 
     with tabs[1]:
-        st.markdown(sl("📝 Driver Onboarding","amber"), unsafe_allow_html=True)
-        ds1,ds2 = st.columns([3,1])
-        with ds1: do_sv = st.text_input("Search existing driver by mobile", key="do_search")
-        with ds2:
-            st.write(""); st.write("")
-            do_dos = st.button("🔍 Search", key="do_search_btn")
-        if do_dos and do_sv:
-            ex = find_row("driver_onboard","Mobile", do_sv.strip())
-            if ex:
-                acct = str(ex.get("Account Number",""))
-                masked = ("*"*(len(acct)-4)+acct[-4:]) if len(acct)>4 else "****"
-                st.success(f"✅ Already onboarded — Driver ID: **{ex['Driver ID']}**")
-                st.json({"Name":ex.get("Full Name"),"Vehicle":ex.get("Vehicle Type"),
-                         "Bank":ex.get("Bank Name"),"Account":masked})
-            else:
-                st.info("Not found — fill form below.")
-        st.divider()
-        dn1,dn2,dn3 = st.columns(3)
-        with dn1:
-            do_name  = st.text_input("Full name *",       key="do_name")
-            do_mob   = st.text_input("Mobile *",          placeholder="10-digit", key="do_mob")
-            do_email = st.text_input("Email",             key="do_email")
-        with dn2:
-            do_veh   = st.selectbox("Vehicle type",["Bike","Auto","Van","Truck","Mini-Truck"], key="do_veh")
-            do_bank  = st.text_input("Bank name *",       key="do_bank")
-            do_acct  = st.text_input("Account number *",  key="do_acct")
-        with dn3:
-            do_ifsc  = st.text_input("IFSC code *",       key="do_ifsc")
-            do_upi   = st.text_input("UPI ID",            placeholder="mobile@upi", key="do_upi")
-        st.caption("🔒 Bank details stored securely, visible to admin only.")
-        if st.button("✅ Onboard Driver", type="primary", use_container_width=True, key="do_btn"):
-            if not all([do_name,do_mob,do_bank,do_acct,do_ifsc]):
-                st.error("Fill all required (*) fields.")
-            else:
-                with st.spinner("Checking duplicates…"):
-                    ex = find_row("driver_onboard","Mobile", do_mob.strip())
-                if ex:
-                    st.warning(f"⚠️ Mobile already registered — Driver ID: **{ex['Driver ID']}**")
-                else:
-                    did = gen_driver_id()
-                    append_row("driver_onboard",[
-                        did,do_name,do_mob,do_email,do_veh,
-                        do_bank,do_acct,do_ifsc,do_upi,
-                        str(date.today()),"Offline","",
-                    ])
-                    st.success(f"✅ Driver onboarded! Permanent Driver ID: **`{did}`**")
-                    st.balloons()
-
-    with tabs[2]:
         st.markdown(sl("📦 Delivery History","amber"), unsafe_allow_html=True)
         df_h = read_sheet("base")
         if df_h.empty:
@@ -1228,26 +1182,34 @@ def page_delivery():
             if my_h.empty:
                 st.info("No completed deliveries yet.")
             else:
+                cols_h = [c for c in ["Order ID","Customer shop name","SKU","SKU Name",
+                           "OrderedQty","Delivery Status","DELIVERED DATE","ReturnQty","Reason"]
+                          if c in my_h.columns]
                 st.dataframe(
-                    my_h[["Order ID","Customer shop name","SKU","OrderedQty",
-                           "Delivery Status","DELIVERED DATE","ReturnQty","Reason"]
-                    ].sort_values("DELIVERED DATE",ascending=False),
+                    my_h[cols_h].sort_values("DELIVERED DATE",ascending=False),
                     use_container_width=True, hide_index=True)
 
+    # FIX #11: task done / logout control
+    st.divider()
+    if not st.session_state.get("task_done", False):
+        if st.button("✅ Mark All Tasks Done (enables Logout)", key="driver_tasks_done"):
+            st.session_state.task_done = True
+            st.rerun()
+    else:
+        st.success("✅ Tasks marked complete — Logout button is now active above.")
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN  —  test connection first, then route to correct page
+#  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
 _using_local_creds = os.path.exists(creds_path)
 
-# Only test connection on cloud (local file is always reliable)
 if not _using_local_creds:
     _ok, _err = _test_connection()
     if not _ok:
         page_credential_error(str(_err))
         st.stop()
 
-# Connection OK → route normally
 if not st.session_state.logged_in:
     page_login()
 else:
