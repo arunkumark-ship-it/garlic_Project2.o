@@ -68,7 +68,7 @@ for _k, _v in DEFAULTS.items():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN REGISTER PASSWORD  — FIX #5
 # ═══════════════════════════════════════════════════════════════════════════════
-ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "NinjaGarlic@2026")
+ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GOOGLE AUTH
@@ -564,14 +564,20 @@ def page_login():
             )
 
             if st.button("Create account →", type="primary", use_container_width=True, key="rg_btn"):
-                if not all([rn, rph, rem, rpw, rpw2, admin_gate]):
-                    st.error("Fill in all fields including the Admin Registration Password.")
-                elif rpw != rpw2:
-                    st.error("Passwords do not match.")
+                if not rn.strip():
+                    st.error("Full name is required.")
+                elif not rph.strip():
+                    st.error("Phone number is required.")
+                elif not rem.strip() or "@" not in rem:
+                    st.error("Enter a valid email address.")
+                elif not rpw:
+                    st.error("Password is required.")
                 elif len(rpw) < 6:
                     st.error("Password min 6 characters.")
-                elif "@" not in rem:
-                    st.error("Enter a valid email address.")
+                elif rpw != rpw2:
+                    st.error("Passwords do not match.")
+                elif not admin_gate:
+                    st.error("❌ Admin Registration Password is required.")
                 elif admin_gate != ADMIN_REGISTER_PASSWORD:
                     st.error("❌ Invalid Admin Registration Password. Contact system admin.")
                 else:
