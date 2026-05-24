@@ -1024,7 +1024,7 @@ def page_sales():
                 help="Type the shop address — plain text, no map search needed")
 
         # ── GPS + Location section ────────────────────────────────────────────
-        st.markdown("**Step 1 — Tap to capture your current location:**")
+        st.markdown("### 📍 GPS Location")
 
         gps_lat, gps_lng = geo_location_button()
 
@@ -1032,26 +1032,9 @@ def page_sales():
         if gps_lat and gps_lng:
             st.session_state["co_lat"] = gps_lat
             st.session_state["co_lng"] = gps_lng
-
-        # Step 2 — Manual fallback
-        st.markdown("**Step 2 — Or enter coordinates manually:**")
-        st.caption("💡 How to get coordinates: Open Google Maps → long-press on the shop → copy the numbers shown at the bottom")
-
-        lat_c, lng_c = st.columns(2)
-
-        with lat_c:
-            co_lat = st.text_input(
-                "gps_lat",
-                placeholder="e.g. 12.9716",
-                key="co_lat"
-            )
-
-        with lng_c:
-            co_lng = st.text_input(
-                "gps_lng",
-                placeholder="e.g. 77.5946",
-                key="co_lng"
-             )
+            st.success("Location captured ✅")
+            co_lat = st.session_state.get("co_lat", "")
+            co_lng = st.session_state.get("co_lng", "")
 
         # Map shows ONLY when both lat & long are filled — based on coordinates only
         if co_lat.strip() and co_lng.strip():
