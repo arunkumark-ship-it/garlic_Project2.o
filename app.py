@@ -1033,8 +1033,9 @@ def page_sales():
             st.session_state["co_lat"] = gps_lat
             st.session_state["co_lng"] = gps_lng
             st.success("Location captured ✅")
-            co_lat = st.session_state.get("co_lat", "")
-            co_lng = st.session_state.get("co_lng", "")
+            
+        co_lat = st.session_state.get("co_lat", "")
+        co_lng = st.session_state.get("co_lng", "")
 
         # Map shows ONLY when both lat & long are filled — based on coordinates only
         if co_lat.strip() and co_lng.strip():
