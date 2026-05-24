@@ -1041,14 +1041,14 @@ def page_sales():
 
         with lat_c:
             co_lat = st.text_input(
-                "Latitude *",
+                "gps_lat",
                 placeholder="e.g. 12.9716",
                 key="co_lat"
             )
 
         with lng_c:
             co_lng = st.text_input(
-                "Longitude *",
+                "gps_lng",
                 placeholder="e.g. 77.5946",
                 key="co_lng"
              )
