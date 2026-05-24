@@ -90,9 +90,13 @@ DEFAULTS = {
     "driver_id":   None,   "driver_active": True,
     "active_stop": 0,      "cust_data":    {},
     "task_done":   False,
-    # FIX J: live location state
+    # Live location state
     "live_lat": "",  "live_lng": "",  "live_acc": "",
-    "loc_fetching": False,   # True while awaiting geolocation response
+    "live_address": "",          # reverse-geocoded human address
+    "loc_fetching": False,
+    "rev_fetching": False,       # True while reverse geocode JS is running
+    # Address autocomplete state
+    "ac_addr_co": "",  "ac_lat_co": "",  "ac_lng_co": "",
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
@@ -393,21 +397,17 @@ def autofill_box(label, value):
             f'<div style="font-size:.95rem;font-weight:500;color:#1a2e22">{val}</div>'
             f'</div>')
 
-# ─── FIX J: Live location via streamlit-js-eval (proper bidirectional) ────────
+# ─── FIX J + K: Live location + reverse geocode + address autocomplete ────────
+
 def live_location_widget():
     """
     Uses get_geolocation() from streamlit-js-eval.
-    - Renders a "📡 Fetch Live Location" button.
-    - When clicked, the browser Geolocation API fires immediately.
-    - Coordinates come back directly to Python — no redirect, no loop.
-    - Stores result in st.session_state.live_lat / live_lng / live_acc.
-    - Returns (lat_str, lng_str, accuracy_str).
-
-    Fallback: if streamlit-js-eval is not installed, shows a manual input pair.
+    On success, also fires a Nominatim reverse-geocode in a sibling JS component
+    and stores the human-readable address in session_state.live_address.
+    Returns (lat_str, lng_str, accuracy_str).
     """
     if not _GEO_AVAILABLE:
-        st.warning("⚠️ `streamlit-js-eval` not installed. Add it to requirements.txt. "
-                   "Falling back to manual entry.")
+        st.warning("⚠️ `streamlit-js-eval` not installed. Add it to requirements.txt.")
         fb1, fb2 = st.columns(2)
         with fb1:
             fb_lat = st.text_input("Latitude",  placeholder="e.g. 12.9716", key="fb_lat")
@@ -415,34 +415,28 @@ def live_location_widget():
             fb_lng = st.text_input("Longitude", placeholder="e.g. 77.5946", key="fb_lng")
         return fb_lat.strip(), fb_lng.strip(), ""
 
-    # ── Button to trigger fetch ───────────────────────────────────────────────
-    already_have = (st.session_state.get("live_lat","") and
-                    st.session_state.get("live_lng",""))
-
+    already_have = bool(st.session_state.get("live_lat",""))
     btn_label = "🔄 Re-fetch Live Location" if already_have else "📡 Fetch Live Location"
 
-    st.markdown(f"""
-<div style="margin-bottom:6px">
-  <span style="font-size:.82rem;color:#5a7a65">
-    Tap the button — your browser will request permission, then pinpoint your current location.
-  </span>
+    st.markdown("""
+<div style="font-size:.82rem;color:#5a7a65;margin-bottom:6px">
+  Tap the button — your browser will request location permission, then pinpoint your position
+  and <strong>auto-fill the shop address</strong> via reverse geocoding.
 </div>""", unsafe_allow_html=True)
 
     fetch = st.button(btn_label, key="loc_fetch_btn",
-                      help="Uses your device GPS / WiFi to get precise coordinates.")
-
+                      help="Uses your device GPS / WiFi for precise coordinates.")
     if fetch:
-        # Clear previous so the component re-fires
-        st.session_state.live_lat = ""
-        st.session_state.live_lng = ""
-        st.session_state.live_acc = ""
+        st.session_state.live_lat     = ""
+        st.session_state.live_lng     = ""
+        st.session_state.live_acc     = ""
+        st.session_state.live_address = ""
         st.session_state.loc_fetching = True
 
-    # ── Call get_geolocation only while fetching ──────────────────────────────
+    # ── Step 1: get coordinates ───────────────────────────────────────────────
     if st.session_state.get("loc_fetching", False):
-        with st.spinner("📡 Contacting your device GPS…"):
-            loc = get_geolocation()   # blocks until browser responds
-
+        with st.spinner("📡 Getting your GPS coordinates…"):
+            loc = get_geolocation()
         if loc and isinstance(loc, dict):
             coords = loc.get("coords", {})
             lat = coords.get("latitude")
@@ -451,28 +445,245 @@ def live_location_widget():
             if lat is not None and lng is not None:
                 st.session_state.live_lat     = f"{lat:.7f}"
                 st.session_state.live_lng     = f"{lng:.7f}"
-                st.session_state.live_acc     = f"{acc:.1f}" if acc is not None else ""
-                st.session_state.loc_fetching = False
-                st.rerun()   # refresh so the map renders
+                st.session_state.live_acc     = f"{acc:.1f}" if acc else ""
+                st.session_state.loc_fetching  = False
+                st.session_state.rev_fetching  = True   # trigger reverse geocode
+                st.rerun()
             else:
                 st.session_state.loc_fetching = False
-                st.error("❌ Location received but coordinates missing. Try again.")
+                st.error("❌ Coordinates missing. Try again.")
         else:
             st.session_state.loc_fetching = False
-            st.error("❌ Could not get location. Allow location access in your browser and retry.")
+            st.error("❌ Location unavailable. Allow browser location access and retry.")
 
-    # ── Show result ───────────────────────────────────────────────────────────
-    cur_lat = st.session_state.get("live_lat", "")
-    cur_lng = st.session_state.get("live_lng", "")
-    cur_acc = st.session_state.get("live_acc", "")
+    # ── Step 2: reverse geocode via JS component (Nominatim, no API key) ──────
+    if st.session_state.get("rev_fetching", False):
+        lat_v = st.session_state.get("live_lat","")
+        lng_v = st.session_state.get("live_lng","")
+
+        # Check if query params already have the reverse-geocoded address
+        qp = st.query_params
+        if "rev_addr" in qp:
+            addr = str(qp["rev_addr"]).strip()
+            st.session_state.live_address = addr
+            st.session_state.rev_fetching = False
+            del qp["rev_addr"]
+            st.rerun()
+        else:
+            # Render a JS component that calls Nominatim and redirects with result
+            rev_html = f"""
+<!DOCTYPE html><html><body>
+<div id="s" style="font-family:sans-serif;font-size:.8rem;color:#5a7a65">
+  🔍 Fetching address from coordinates…
+</div>
+<script>
+(function(){{
+  var lat={lat_v}, lng={lng_v};
+  fetch('https://nominatim.openstreetmap.org/reverse?lat='+lat+'&lon='+lng+'&format=json',
+    {{headers:{{'Accept-Language':'en','User-Agent':'GarlicOrderApp/1.0'}}}})
+  .then(function(r){{return r.json();}})
+  .then(function(d){{
+    var addr = d.display_name || '';
+    // Shorten: take first 3 comma-parts (road, suburb, city)
+    var parts = addr.split(',').slice(0,4).join(',').trim();
+    document.getElementById('s').innerText = '✅ ' + parts;
+    var url = new URL(window.parent.location.href);
+    url.searchParams.set('rev_addr', parts);
+    window.parent.location.href = url.toString();
+  }})
+  .catch(function(){{
+    document.getElementById('s').innerText = '⚠️ Reverse geocode unavailable';
+    var url = new URL(window.parent.location.href);
+    url.searchParams.set('rev_addr', lat+', '+lng);
+    window.parent.location.href = url.toString();
+  }});
+}})();
+</script>
+</body></html>
+"""
+            st.components.v1.html(rev_html, height=40, scrolling=False)
+
+    # ── Show captured result ──────────────────────────────────────────────────
+    cur_lat  = st.session_state.get("live_lat",  "")
+    cur_lng  = st.session_state.get("live_lng",  "")
+    cur_acc  = st.session_state.get("live_acc",  "")
+    cur_addr = st.session_state.get("live_address","")
 
     if cur_lat and cur_lng:
-        acc_txt = f" · accuracy ±{cur_acc} m" if cur_acc else ""
-        st.success(f"✅ Live location captured: **{cur_lat}**, **{cur_lng}**{acc_txt}")
+        acc_txt = f" · ±{cur_acc} m" if cur_acc else ""
+        st.success(f"✅ **{cur_lat}**, **{cur_lng}**{acc_txt}")
+        if cur_addr:
+            st.info(f"📍 Detected address: **{cur_addr}**")
         st.markdown(map_embed_coords(cur_lat, cur_lng, 230), unsafe_allow_html=True)
-        st.caption("🗺️ Confirm the pin is on your shop before saving.")
+        st.caption("🗺️ Confirm the pin is on the correct shop before saving.")
 
     return cur_lat, cur_lng, cur_acc
+
+
+def address_autocomplete_widget(current_value: str = "", key_suffix: str = "co") -> str:
+    """
+    Renders a Nominatim-powered search-as-you-type address autocomplete
+    inside an st.components.v1.html iframe.
+
+    - User types a partial address / shop name
+    - Suggestions appear as a dropdown (fetched from Nominatim)
+    - Clicking a suggestion:
+        1. Fills the address field inside the component
+        2. Sets query param addr_{key_suffix} → triggers Streamlit rerun
+        3. Also sets addr_{key_suffix}_lat / addr_{key_suffix}_lng so the map
+           can update to the chosen place
+
+    Returns the selected address string (or current_value if nothing selected yet).
+    """
+    qp = st.query_params
+    lat_key  = f"addr_{key_suffix}_lat"
+    lng_key  = f"addr_{key_suffix}_lng"
+    addr_key = f"addr_{key_suffix}"
+
+    # Consume query params written by the JS component
+    if addr_key in qp:
+        selected = str(qp[addr_key]).strip()
+        st.session_state[f"ac_addr_{key_suffix}"] = selected
+        if lat_key in qp:
+            st.session_state[f"ac_lat_{key_suffix}"]  = str(qp[lat_key])
+        if lng_key in qp:
+            st.session_state[f"ac_lng_{key_suffix}"]  = str(qp[lng_key])
+        # Clean up
+        for k in [addr_key, lat_key, lng_key]:
+            if k in qp: del qp[k]
+        st.rerun()
+
+    resolved = st.session_state.get(f"ac_addr_{key_suffix}", current_value)
+    ac_lat   = st.session_state.get(f"ac_lat_{key_suffix}", "")
+    ac_lng   = st.session_state.get(f"ac_lng_{key_suffix}", "")
+
+    # The autocomplete HTML component
+    safe_val = resolved.replace("'", "\\'").replace('"', '&quot;')
+    ac_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'DM Sans',sans-serif;background:transparent;padding:2px 0}}
+  #wrap{{position:relative;width:100%}}
+  #inp{{
+    width:100%;padding:9px 12px;font-size:.9rem;
+    border:1.5px solid #c8e6d4;border-radius:10px;
+    background:#fff;color:#1a2e22;outline:none;
+    transition:border-color .2s;
+  }}
+  #inp:focus{{border-color:#1a7f4b;box-shadow:0 0 0 3px rgba(26,127,75,.12)}}
+  #list{{
+    position:absolute;top:calc(100% + 4px);left:0;right:0;
+    background:#fff;border:1.5px solid #c8e6d4;border-radius:10px;
+    box-shadow:0 8px 24px rgba(0,0,0,.12);z-index:9999;
+    max-height:220px;overflow-y:auto;display:none;
+  }}
+  .item{{
+    padding:9px 13px;font-size:.82rem;color:#1a2e22;cursor:pointer;
+    border-bottom:1px solid #eef5f0;line-height:1.35;
+  }}
+  .item:last-child{{border-bottom:none}}
+  .item:hover,.item.active{{background:#f0faf4;color:#1a7f4b}}
+  #status{{font-size:.72rem;color:#5a7a65;margin-top:4px;min-height:1rem;padding-left:2px}}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <input id="inp" type="text" placeholder="Search shop name or street address…"
+         value="{safe_val}" autocomplete="off" spellcheck="false"/>
+  <div id="list"></div>
+</div>
+<div id="status"></div>
+<script>
+var inp   = document.getElementById('inp');
+var list  = document.getElementById('list');
+var stat  = document.getElementById('status');
+var timer = null;
+var items = [];
+var sel   = -1;
+
+inp.addEventListener('input', function(){{
+  clearTimeout(timer);
+  var q = inp.value.trim();
+  if(q.length < 3){{ list.style.display='none'; return; }}
+  stat.innerText = '🔍 Searching…';
+  timer = setTimeout(function(){{ doSearch(q); }}, 350);
+}});
+
+inp.addEventListener('keydown', function(e){{
+  var rows = list.querySelectorAll('.item');
+  if(e.key==='ArrowDown'){{   sel=Math.min(sel+1,rows.length-1); highlight(rows); e.preventDefault(); }}
+  else if(e.key==='ArrowUp'){{ sel=Math.max(sel-1,0);           highlight(rows); e.preventDefault(); }}
+  else if(e.key==='Enter' && sel>=0){{ rows[sel].click(); e.preventDefault(); }}
+  else if(e.key==='Escape'){{ list.style.display='none'; }}
+}});
+
+function highlight(rows){{
+  rows.forEach(function(r,i){{ r.classList.toggle('active', i===sel); }});
+  if(sel>=0) rows[sel].scrollIntoView({{block:'nearest'}});
+}}
+
+function doSearch(q){{
+  fetch('https://nominatim.openstreetmap.org/search?q='+encodeURIComponent(q)
+      +'&format=json&limit=6&addressdetails=1',
+      {{headers:{{'Accept-Language':'en','User-Agent':'GarlicOrderApp/1.0'}}}})
+  .then(function(r){{return r.json();}})
+  .then(function(data){{
+    stat.innerText = data.length ? '' : '⚠️ No results — try a different search.';
+    items = data;
+    sel = -1;
+    list.innerHTML = '';
+    if(!data.length){{ list.style.display='none'; return; }}
+    data.forEach(function(d,i){{
+      var div = document.createElement('div');
+      div.className = 'item';
+      // Show short label (road + city) on first line, full address smaller
+      var short = [d.address.road,d.address.suburb,d.address.city||d.address.town||d.address.village]
+                   .filter(Boolean).join(', ');
+      div.innerHTML = '<strong>'+(short||d.display_name.split(',')[0])+'</strong>'
+                    + '<br><span style="font-size:.72rem;color:#5a7a65">'
+                    + d.display_name.split(',').slice(0,4).join(',') + '</span>';
+      div.addEventListener('click', function(){{
+        var chosen = d.display_name.split(',').slice(0,5).join(',').trim();
+        inp.value = chosen;
+        list.style.display = 'none';
+        stat.innerText = '✅ Selected';
+        // Send back to Streamlit via parent URL redirect
+        var url = new URL(window.parent.location.href);
+        url.searchParams.set('{addr_key}', chosen);
+        url.searchParams.set('{lat_key}',  d.lat);
+        url.searchParams.set('{lng_key}',  d.lon);
+        window.parent.location.href = url.toString();
+      }});
+      list.appendChild(div);
+    }});
+    list.style.display = 'block';
+  }})
+  .catch(function(){{
+    stat.innerText = '⚠️ Search unavailable — type address manually.';
+    list.style.display = 'none';
+  }});
+}}
+
+// Close dropdown on outside click
+document.addEventListener('click', function(e){{
+  if(!document.getElementById('wrap').contains(e.target))
+    list.style.display='none';
+}});
+</script>
+</body>
+</html>
+"""
+    st.components.v1.html(ac_html, height=62, scrolling=False)
+
+    # If a suggestion was picked, show its coordinates too
+    if ac_lat and ac_lng and not st.session_state.get("live_lat",""):
+        st.caption(f"📍 From search: {ac_lat}, {ac_lng}")
+
+    return resolved, ac_lat, ac_lng
 
 
 def topbar(role_label, role_color="#1a7f4b"):
@@ -997,47 +1208,80 @@ def page_sales():
             co_cls   = st.selectbox("Classification",
                 ["A","B","C","Premium","Wholesale","Retail"],                   key="co_cls")
         with nc3:
-            co_addr  = st.text_input("Shop address *",
-                placeholder="House/street/landmark…",                           key="co_addr")
+            co_addr_label = st.empty()
+            co_addr_label.markdown("**Shop address \\***")
 
-        # Address map preview
+        # ── Shop Address: autocomplete search (Nominatim) ─────────────────────
+        st.markdown(sl("📍 Shop Address"), unsafe_allow_html=True)
+        st.markdown(
+            "**Search** by shop name or street — or tap **Fetch Live Location** "
+            "to auto-detect address and coordinates from your device GPS:",
+            unsafe_allow_html=False)
+
+        # Pre-fill with reverse-geocoded address if GPS was used
+        prefill_addr = st.session_state.get("live_address","") or \
+                       st.session_state.get("ac_addr_co","")
+
+        # Autocomplete widget — search-as-you-type powered by Nominatim
+        st.markdown('<div style="margin-bottom:4px"><span style="font-size:.82rem;'
+                    'font-weight:600;color:#1a2e22">Search address / shop name</span></div>',
+                    unsafe_allow_html=True)
+        ac_addr, ac_lat, ac_lng = address_autocomplete_widget(prefill_addr, "co")
+
+        # Manual text area as fallback / override (also shows what autocomplete picked)
+        co_addr = st.text_input(
+            "Confirmed shop address *",
+            value=ac_addr or prefill_addr,
+            key="co_addr",
+            placeholder="Full address will appear here after search or GPS fetch",
+            help="Edit if needed after selecting from search or fetching GPS location",
+        )
+
+        # Show map for the confirmed address
         if co_addr and co_addr.strip():
-            st.markdown(map_embed(co_addr, 200), unsafe_allow_html=True)
-            st.caption("📍 Address-based preview — capture live location below for an exact GPS pin.")
+            if ac_lat and ac_lng and not st.session_state.get("live_lat",""):
+                # Use precise coords from autocomplete selection
+                st.markdown(map_embed_coords(ac_lat, ac_lng, 200), unsafe_allow_html=True)
+            else:
+                st.markdown(map_embed(co_addr, 200), unsafe_allow_html=True)
+            st.caption("📍 Confirm this is the correct shop location.")
 
-        # ── FIX J: Live Location Section ──────────────────────────────────────
+        # ── FIX J: Live Location + Reverse Geocode ────────────────────────────
         st.markdown(sl("📡 Live Location"), unsafe_allow_html=True)
 
-        # Manual override columns — shown above the fetch button
-        # so SE can also type coordinates if device GPS is unavailable
         g1, g2 = st.columns(2)
         with g1:
             co_lat_manual = st.text_input("Latitude (manual override)",
                                           placeholder="e.g. 12.9716", key="co_lat_manual",
-                                          help="Leave blank to use Live Location button below")
+                                          help="Auto-filled by GPS button, or type manually")
         with g2:
             co_lng_manual = st.text_input("Longitude (manual override)",
                                           placeholder="e.g. 77.5946", key="co_lng_manual",
-                                          help="Leave blank to use Live Location button below")
+                                          help="Auto-filled by GPS button, or type manually")
 
-        # Live location widget — button + spinner + map preview
+        # Live location widget — GPS button + reverse geocode + map
         live_lat, live_lng, live_acc = live_location_widget()
 
-        # Priority: manual entry overrides live if the SE typed something
-        final_lat = co_lat_manual.strip() or live_lat
-        final_lng = co_lng_manual.strip() or live_lng
+        # Merge: GPS > autocomplete coords > manual
+        final_lat = live_lat or co_lat_manual.strip() or ac_lat
+        final_lng = live_lng or co_lng_manual.strip() or ac_lng
 
-        # Show manual-entry map only when manually typed AND live not captured
+        # If GPS gave an address and the confirmed address is still empty, offer it
+        rev_addr = st.session_state.get("live_address","")
+        if rev_addr and not co_addr.strip():
+            st.info(f"💡 GPS-detected address: **{rev_addr}** — copy it to the address field above if correct.")
+
+        # Show map for manual lat/lng only (GPS map shown inside live_location_widget)
         if co_lat_manual.strip() and co_lng_manual.strip() and not live_lat:
-            st.markdown(map_embed_coords(co_lat_manual.strip(), co_lng_manual.strip(), 210),
+            st.markdown(map_embed_coords(co_lat_manual.strip(), co_lng_manual.strip(), 200),
                         unsafe_allow_html=True)
-            st.caption(f"📍 Manual coordinates: {co_lat_manual.strip()}, {co_lng_manual.strip()}")
+            st.caption(f"📍 Manual: {co_lat_manual.strip()}, {co_lng_manual.strip()}")
 
         if st.button("✅ Onboard Customer",type="primary",use_container_width=True,key="co_btn"):
             if not all([co_name.strip(),co_mob.strip(),co_shop.strip(),co_addr.strip()]):
-                st.error("Fill all required (*) fields.")
+                st.error("Fill all required (*) fields including the confirmed shop address.")
             elif not final_lat or not final_lng:
-                st.error("📍 Location required. Tap 'Fetch Live Location' or enter coordinates manually.")
+                st.error("📍 Location required. Tap 'Fetch Live Location' or enter/search an address with coordinates.")
             else:
                 with st.spinner("Checking duplicates…"):
                     ex = find_row("customer_onboard","Mobile",co_mob.strip())
@@ -1052,11 +1296,11 @@ def page_sales():
                         final_lat, final_lng,
                     ])
                     load_customers.clear()
-                    # Clear live location after successful save
-                    st.session_state.live_lat = ""
-                    st.session_state.live_lng = ""
-                    st.session_state.live_acc = ""
-                    st.success(f"✅ Onboarded! CUST-ID: **`{cid}`** · Saved at {final_lat}, {final_lng}")
+                    # Clear live location + autocomplete state after save
+                    for k in ["live_lat","live_lng","live_acc","live_address",
+                              "ac_addr_co","ac_lat_co","ac_lng_co"]:
+                        st.session_state[k] = ""
+                    st.success(f"✅ Onboarded! CUST-ID: **`{cid}`** · Coords: {final_lat}, {final_lng}")
                     st.session_state.task_done = True
                     st.balloons()
 
