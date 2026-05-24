@@ -1017,32 +1017,8 @@ def page_sales():
             co_city=st.selectbox("City *",
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
-                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Cafe","Bar","Cloud kitchen"],key="co_cls")
-            co_cuisine = st.selectbox(
-    "Cuisine",
-    [
-        "Asian Cuisines",
-        "Italian Cuisines",
-        "Middle East Cuisines",
-        "Multicuisine Cuisines",
-        "North Indian Cuisines",
-        "South Indian Cuisines",
-        "Biriyani",
-        "Other"
-    ],
-    key="co_cuisine"
-)
-
-# Show text box if Other selected
-if co_cuisine == "Other":
-    co_cuisine_other = st.text_input(
-        "Enter Cuisine Name",
-        placeholder="Type your cuisine here",
-        key="co_cuisine_other"
-    )
-else:
-    co_cuisine_other = co_cuisine    
-            co_addr=st.text_input("Shop address",
+                ["A","B","C","Premium","Wholesale","Retail"],key="co_cls")
+            co_addr=st.text_input("Shop address *",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr",
                 help="Type the shop address — plain text, no map search needed")
