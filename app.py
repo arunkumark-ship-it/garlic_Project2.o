@@ -1018,8 +1018,6 @@ def page_sales():
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
                 ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"],key="co_cls")
-            co_Cusine =st.selectbox("Cusine",
-                ["Asian Cuisines","Italian Cuisines","Middle East Cuisines"","Multicuisine Cuisines","North Indian Cuisines","South Indian Cuisines","Biriyani","Others"],key="co_Cusine")
             co_addr=st.text_input("Shop address",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr",
