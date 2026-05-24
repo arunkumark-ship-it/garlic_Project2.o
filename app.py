@@ -1018,12 +1018,6 @@ def page_sales():
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
                 ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail"],key="co_cls")
-            if co_Cls == "Other":
-                co_cls_Other = st.text_input("Enter Classification Name",
-                placeholder="Type your Classification here",
-                key="Co_cls_Other")
-            else:
-                co_cls_Other =co_cls
             co_addr=st.text_input("Shop address",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr",
