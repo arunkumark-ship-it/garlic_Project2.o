@@ -1,10 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  Garlic Order & Delivery Platform  —  app.py  FINAL v8                     ║
-# ║  FIX A: GPS auto-fills Latitude + Longitude text fields directly           ║
-# ║         (writes to st.session_state["co_lat"] / ["co_lng"] before render) ║
-# ║  FIX B: Order fetch — auto-fills all fields incl. Lat/Long                ║
-# ║  FIX C: Driver onboard — Vehicle Number field                              ║
-# ║  FIX D: Orders page — today's orders by default                            ║
+# ║  GPS FIX: Single "Get My Location" button → auto-fills Lat/Long            ║
+# ║           → shows map preview → saves to sheet                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 import os, uuid, textwrap
 from datetime import datetime, date
@@ -55,9 +52,9 @@ header[data-testid="stHeader"]{ background:transparent; }
   background:#e6f1fb; border:1px solid #b5d4f4; border-radius:10px;
   padding:10px 14px; margin:6px 0; font-size:13px;
 }
-.gps-filled{
-  background:#e1f5ee; border:2px solid #1a7f4b; border-radius:10px;
-  padding:10px 14px; margin:4px 0 8px; font-size:.9rem; font-weight:600; color:#0d1f14;
+.gps-box{
+  background:#e8f5e9; border:2px solid #1a7f4b; border-radius:12px;
+  padding:12px 16px; margin:8px 0; font-size:14px; font-weight:600; color:#0d1f14;
 }
 div[data-testid="stTextInput"] input,
 div[data-testid="stSelectbox"] select,
@@ -82,31 +79,11 @@ DEFAULTS = {
     "driver_id": None,  "driver_active": True,
     "active_stop": 0,   "cust_data": {},
     "task_done": False,
-    # GPS: written before co_lat/co_lng widgets render → they pick up the value
-    "co_lat": "", "co_lng": "",
+    "_geo_lat": "", "_geo_lng": "",
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
-
-# ── FIX A: Read GPS query params IMMEDIATELY on every run, before any widget ──
-# When the JS redirects with ?_lat=...&_lng=..., we consume them here and
-# write into st.session_state["co_lat"] / ["co_lng"].
-# Because this runs before the text_input widgets render, the widgets get the
-# correct value= from session_state automatically.
-_qp = st.query_params
-if "_lat" in _qp and "_lng" in _qp:
-    try:
-        _lat_v = float(_qp["_lat"])
-        _lng_v = float(_qp["_lng"])
-        st.session_state["co_lat"] = f"{_lat_v:.6f}"
-        st.session_state["co_lng"] = f"{_lng_v:.6f}"
-    except Exception:
-        pass
-    # Remove from URL so they don't persist on next rerun
-    del _qp["_lat"]
-    del _qp["_lng"]
-    # No st.rerun() needed — the current rerun already has the updated session state
 
 ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
 
@@ -199,12 +176,21 @@ HEADERS = {
     "trips": ["Trip ID","Date","City","Shops","Driver UID","Driver Name","Status","Created By","Created At"],
 }
 
+# ── Sheet helpers ─────────────────────────────────────────────────────────────
 def open_spreadsheet():
     client = get_gspread_client()
     try:
         return client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        st.error(f'Sheet not found: "{SPREADSHEET_NAME}". Create it and share with service account.')
+        st.error(f"""
+❌ **Sheet not found: "{SPREADSHEET_NAME}"**
+
+**One-time setup:**
+1. Go to [sheets.google.com](https://sheets.google.com) → New blank spreadsheet
+2. Rename it exactly: **`Garlic_Order & Delivery Project`**
+3. Share it with your service-account `client_email` as **Editor**
+4. Reboot this app
+""")
         st.stop()
 
 def get_ws(key: str):
@@ -216,7 +202,8 @@ def get_ws(key: str):
         if key in HEADERS: ws.append_row(HEADERS[key])
         return ws
     if key in HEADERS:
-        expected = HEADERS[key]; current = ws.row_values(1)
+        expected = HEADERS[key]
+        current  = ws.row_values(1)
         if not current:
             ws.append_row(expected)
         else:
@@ -241,9 +228,10 @@ def append_row(key: str, row: list):
     expected = HEADERS[key]
     if len(row) != len(expected):
         ws.append_row(row, value_input_option="USER_ENTERED"); return
-    data_dict = dict(zip(expected, row))
+    data_dict    = dict(zip(expected, row))
     live_headers = ws.row_values(1)
-    ws.append_row([data_dict.get(h,"") for h in live_headers], value_input_option="USER_ENTERED")
+    ordered_row  = [data_dict.get(h,"") for h in live_headers]
+    ws.append_row(ordered_row, value_input_option="USER_ENTERED")
 
 def update_row(key: str, id_col: str, id_val: str, updates: dict) -> bool:
     ws = get_ws(key); headers = ws.row_values(1)
@@ -272,17 +260,19 @@ def load_skus() -> pd.DataFrame: return read_sheet("skus")
 
 def active_skus() -> pd.DataFrame:
     df = load_skus()
-    return df[df["Active"].astype(str).str.lower()=="true"] if not df.empty else df
+    if df.empty: return df
+    return df[df["Active"].astype(str).str.lower() == "true"]
 
 def all_drivers() -> pd.DataFrame: return read_sheet("driver_onboard")
 
 def active_drivers() -> pd.DataFrame:
     df = all_drivers()
-    return df[df["Active Status"].astype(str).str.lower()=="active"] if not df.empty else df
+    if df.empty: return df
+    return df[df["Active Status"].astype(str).str.lower() == "active"]
 
 def set_driver_status(driver_id: str, status: str):
-    update_row("driver_onboard","Driver ID",driver_id,
-               {"Active Status":status,"Last Active":datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    update_row("driver_onboard","Driver ID",driver_id,{"Active Status":status,"Last Active":ts})
 
 def get_driver_trip(driver_uid: str):
     df = read_sheet("trips")
@@ -292,11 +282,10 @@ def get_driver_trip(driver_uid: str):
     return m.iloc[0].to_dict() if not m.empty else None
 
 def write_admin_log(admin_uid, mail_id, action, entity, entity_id, old="", new="", notes=""):
-    append_row("admin_log",[
-        "LOG-"+uuid.uuid4().hex[:6].upper(),
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        admin_uid, mail_id, action, entity, str(entity_id), str(old), str(new), notes
-    ])
+    lid = "LOG-"+uuid.uuid4().hex[:6].upper()
+    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    append_row("admin_log",[lid,ts,admin_uid,mail_id,action,entity,
+                             str(entity_id),str(old),str(new),notes])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH
@@ -321,7 +310,8 @@ def register_user(name, phone, email, role, password):
     return uid, None
 
 def login_user(email, password):
-    user = find_row("user_registry","Email",email.strip().lower())
+    email = email.strip().lower()
+    user  = find_row("user_registry","Email",email)
     if not user: return None,"Email not found."
     stored = str(user.get("Password","") or user.get("Password Hash",""))
     if stored != str(password): return None,"Incorrect password."
@@ -339,79 +329,102 @@ def sl(label, color=""):
 def pill(text, cls="pill-pend"):
     return f'<span class="pill {cls}">{text}</span>'
 
-def map_embed(query, height=260):
-    q = str(query).strip()
-    if not q: return ""
+def map_embed(lat, lng, height=260):
+    """Embed Google Map using lat/lng coordinates."""
+    if not lat or not lng: return ""
     return (f'<div class="map-frame"><iframe width="100%" height="{height}"'
             f' frameborder="0" style="border:0;display:block" allowfullscreen'
-            f' src="https://maps.google.com/maps?q={q.replace(" ","+")}&output=embed&z=16">'
+            f' src="https://maps.google.com/maps?q={lat},{lng}&output=embed&z=16">'
             f'</iframe></div>')
 
-# ─── FIX A: GPS button — writes to parent URL → consumed at TOP of script ─────
-def geo_button():
+# ── GPS COMPONENT ─────────────────────────────────────────────────────────────
+def gps_capture_component():
     """
-    Renders a 'Get My Current Location' button.
-    On click, JS calls navigator.geolocation, then sets the parent page URL
-    to ?_lat=XX&_lng=YY.  Streamlit re-runs, the query-param block at the
-    TOP of this file writes the values into st.session_state["co_lat"] and
-    ["co_lng"] BEFORE the text_input widgets render — so the fields show the
-    captured coordinates immediately.
+    Single GPS button component.
+    - Reads _lat/_lng from query params if browser redirected back after GPS capture.
+    - Renders the HTML button that triggers geolocation and redirects with coords.
+    - Returns (lat_str, lng_str) from session state.
     """
-    geo_html = """
-<!DOCTYPE html><html>
+    # Step 1: On page load, check if query params contain GPS coords from previous capture
+    qp = st.query_params
+    if "_lat" in qp and "_lng" in qp:
+        try:
+            lat = float(qp["_lat"])
+            lng = float(qp["_lng"])
+            st.session_state["_geo_lat"] = f"{lat:.6f}"
+            st.session_state["_geo_lng"] = f"{lng:.6f}"
+        except Exception:
+            pass
+        # Clean URL — remove GPS params then rerun cleanly
+        del qp["_lat"]
+        del qp["_lng"]
+        st.rerun()
+
+    cur_lat = st.session_state.get("_geo_lat", "")
+    cur_lng = st.session_state.get("_geo_lng", "")
+
+    # Step 2: Render the GPS button HTML component
+    geo_html = f"""
+<!DOCTYPE html>
+<html>
 <body style="margin:0;padding:0;background:transparent;font-family:sans-serif">
-<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-  <button id="gbtn" onclick="doGeo()"
-    style="background:#185fa5;color:#fff;border:none;padding:10px 22px;
-           border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;
-           box-shadow:0 3px 10px rgba(24,95,165,.28);white-space:nowrap">
-    📍 Get My Current Location
-  </button>
-  <span id="gstat"
-    style="font-size:12px;color:#5a7a65;min-width:180px"></span>
-</div>
+
+<button id="gbtn" onclick="doGeo()"
+  style="background:#1a7f4b;color:#fff;border:none;padding:11px 24px;
+         border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;
+         display:flex;align-items:center;gap:8px;box-shadow:0 4px 12px rgba(26,127,75,.3)">
+  📍 Get My Current Location
+</button>
+<div id="gstat" style="margin-top:8px;font-size:13px;color:#1a7f4b;font-weight:600;min-height:20px"></div>
+
 <script>
-function doGeo(){
-  var s=document.getElementById('gstat');
-  var b=document.getElementById('gbtn');
-  if(!navigator.geolocation){
-    s.style.color='#842029';
-    s.textContent='❌ Geolocation not supported by this browser.';
+function doGeo() {{
+  var s = document.getElementById('gstat');
+  var b = document.getElementById('gbtn');
+  b.disabled = true;
+  b.style.opacity = '0.7';
+  s.innerHTML = '⏳ Getting your location…';
+  s.style.color = '#854f0b';
+
+  if (!navigator.geolocation) {{
+    s.innerHTML = '❌ Geolocation is not supported by this browser.';
+    s.style.color = '#842029';
+    b.disabled = false; b.style.opacity = '1';
     return;
-  }
-  b.disabled=true; b.style.opacity='.6';
-  s.style.color='#5a7a65';
-  s.textContent='⏳ Fetching your location…';
+  }}
+
   navigator.geolocation.getCurrentPosition(
-    function(pos){
-      var lat=pos.coords.latitude.toFixed(6);
-      var lng=pos.coords.longitude.toFixed(6);
-      s.style.color='#1a7f4b';
-      s.textContent='✅ Got: '+lat+', '+lng+' — filling fields…';
-      // Navigate parent page with coords as query params
-      // The Python top-level block reads these and sets session_state["co_lat"/"co_lng"]
-      var url=new URL(window.parent.location.href);
-      url.searchParams.set('_lat',lat);
-      url.searchParams.set('_lng',lng);
-      window.parent.location.href=url.toString();
-    },
-    function(err){
-      b.disabled=false; b.style.opacity='1';
-      var msgs={
-        1:'Permission denied — tap your browser address bar → allow location.',
-        2:'Position unavailable — check GPS/WiFi.',
-        3:'Timed out — try again.'
-      };
-      s.style.color='#842029';
-      s.textContent='❌ '+(msgs[err.code]||err.message);
-    },
-    {enableHighAccuracy:true,timeout:15000,maximumAge:0}
+    function(pos) {{
+      var lat = pos.coords.latitude.toFixed(6);
+      var lng = pos.coords.longitude.toFixed(6);
+      s.innerHTML = '✅ Location captured: ' + lat + ', ' + lng + '<br><small style="color:#5a7a65">Updating fields…</small>';
+      s.style.color = '#1a7f4b';
+      // Write coords to parent URL → triggers Streamlit rerun which fills the fields
+      var url = new URL(window.parent.location.href);
+      url.searchParams.set('_lat', lat);
+      url.searchParams.set('_lng', lng);
+      window.parent.location.href = url.toString();
+    }},
+    function(err) {{
+      var msgs = {{
+        1: '❌ Permission denied — please allow location access in your browser settings.',
+        2: '❌ Position unavailable — try again.',
+        3: '❌ Request timed out — try again.'
+      }};
+      s.innerHTML = msgs[err.code] || '❌ ' + err.message;
+      s.style.color = '#842029';
+      b.disabled = false; b.style.opacity = '1';
+    }},
+    {{enableHighAccuracy: true, timeout: 15000, maximumAge: 0}}
   );
-}
+}}
 </script>
-</body></html>
+</body>
+</html>
 """
-    st.components.v1.html(geo_html, height=50, scrolling=False)
+    st.components.v1.html(geo_html, height=90, scrolling=False)
+    return cur_lat, cur_lng
+
 
 def topbar(role_label, role_color="#1a7f4b"):
     user = st.session_state.user
@@ -486,29 +499,36 @@ def page_login():
                         st.rerun()
 
         with tab_rg:
-            rn       = st.text_input("Full name *",                                    key="rg_name")
-            rph      = st.text_input("Phone number *",                                 key="rg_ph")
-            rem      = st.text_input("Email (Login ID) *", placeholder="you@example.com", key="rg_email")
-            rrol     = st.selectbox("Role *", ["sales executive","delivery Driver","admin"], key="rg_role")
-            rpw      = st.text_input("Password *",          type="password",            key="rg_pw")
-            rpw2     = st.text_input("Confirm password *",  type="password",            key="rg_pw2")
-            adm_gate = st.text_input("Admin Registration Password *",
-                                     type="password", key="rg_adm_gate",
-                                     help="Required for all roles. Contact admin.")
+            rn        = st.text_input("Full name *", key="rg_name")
+            rph       = st.text_input("Phone number *", key="rg_ph")
+            rem       = st.text_input("Email (Login ID) *", placeholder="you@example.com", key="rg_email")
+            rrol      = st.selectbox("Role *", ["sales executive","delivery Driver","admin"], key="rg_role")
+            rpw       = st.text_input("Password *", type="password", key="rg_pw")
+            rpw2      = st.text_input("Confirm password *", type="password", key="rg_pw2")
+            adm_gate  = st.text_input("Admin Registration Password *",
+                                       type="password", key="rg_adm_gate",
+                                       help="Required for all roles. Contact admin.")
             if st.button("Create account →", type="primary", use_container_width=True, key="rg_btn"):
-                if not all([rn,rph,rem,rpw,rpw2]):      st.error("Fill all required fields.")
-                elif "@" not in rem:                      st.error("Enter a valid email.")
-                elif len(rpw) < 6:                        st.error("Password min 6 characters.")
-                elif rpw != rpw2:                         st.error("Passwords do not match.")
-                elif not adm_gate:                        st.error("Admin Registration Password required.")
-                elif adm_gate != ADMIN_REGISTER_PASSWORD: st.error("❌ Wrong Admin Registration Password.")
+                if not all([rn,rph,rem,rpw,rpw2]):
+                    st.error("Fill all required fields.")
+                elif "@" not in rem:
+                    st.error("Enter a valid email address.")
+                elif len(rpw) < 6:
+                    st.error("Password min 6 characters.")
+                elif rpw != rpw2:
+                    st.error("Passwords do not match.")
+                elif not adm_gate:
+                    st.error("❌ Admin Registration Password required.")
+                elif adm_gate != ADMIN_REGISTER_PASSWORD:
+                    st.error("❌ Wrong Admin Registration Password.")
                 else:
                     with st.spinner("Creating account…"):
                         uid, err = register_user(rn, rph, rem, rrol, rpw)
-                    if err: st.error(f"❌ {err}")
+                    if err:
+                        st.error(f"❌ {err}")
                     else:
                         st.success("✅ Account created!")
-                        st.info(f"UID: **`{uid}`** — Login with: **{rem.strip().lower()}**")
+                        st.info(f"UID: **`{uid}`** — Login with email: **{rem.strip().lower()}**")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE: ADMIN
@@ -519,6 +539,7 @@ def page_admin():
     tabs = st.tabs(["📦 SKUs","🗺️ Trips","🚚 Assign Drivers",
                     "👤 Customers","🚗 Driver Onboard","📋 Orders","📝 Audit Log"])
 
+    # TAB 0 — SKUs
     with tabs[0]:
         st.markdown(sl("📦 SKU Master"), unsafe_allow_html=True)
         df_sku = read_sheet("skus")
@@ -545,19 +566,20 @@ def page_admin():
                     st.error("SKU code already exists.")
                 else:
                     append_row("skus",[sk_code,sk_name,sk_price,sk_wt,
-                                       sk_cat or "General","true",user["uid"],str(date.today())])
+                                       sk_cat or "General","true",
+                                       user["uid"],str(date.today())])
                     load_skus.clear()
                     write_admin_log(user["uid"],user.get("email",""),"ADD SKU","SKU",sk_code,"","",sk_name)
                     st.success(f"✅ SKU **{sk_code}** added!")
-                    st.session_state.task_done=True; st.rerun()
+                    st.session_state.task_done = True; st.rerun()
         df_sku = read_sheet("skus")
         if df_sku.empty:
             st.info("No SKUs yet.")
         else:
             for idx, row in df_sku.iterrows():
                 c1,c2,c3,c4,c5,c6 = st.columns([1.5,2.5,1.2,1.5,0.8,1.5])
-                c1.markdown(f"**`{row['SKU Code']}`**"); c2.write(str(row["SKU Name"]))
-                c3.write(str(row.get("Weight Type","")))
+                c1.markdown(f"**`{row['SKU Code']}`**")
+                c2.write(str(row["SKU Name"])); c3.write(str(row.get("Weight Type","")))
                 cur_p = float(str(row["Price"]).replace("₹","").replace(",","") or 0)
                 new_p = c4.number_input("₹",value=cur_p,step=1.0,key=f"skp{idx}",label_visibility="collapsed")
                 is_act = str(row.get("Active","")).lower()=="true"
@@ -571,6 +593,7 @@ def page_admin():
                     load_skus.clear(); st.session_state.task_done=True; st.rerun()
                 st.divider()
 
+    # TAB 1 — Trips
     with tabs[1]:
         st.markdown(sl("🗺️ Trips & Routes"), unsafe_allow_html=True)
         with st.expander("➕ Create new trip"):
@@ -582,19 +605,19 @@ def page_admin():
                 tr_city = st.selectbox("City",
                     ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="tr_city")
             custs_df = load_customers()
-            sel_ids = []
             if not custs_df.empty:
                 shop_opts = custs_df.apply(
                     lambda r: f"{r['CUST-ID']} — {r['Shop Name']} ({r['City']})",axis=1).tolist()
                 cust_ids  = custs_df["CUST-ID"].tolist()
                 sel_shops = st.multiselect("Select shops * (multiple allowed)",shop_opts,key="tr_shops")
                 sel_ids   = [cust_ids[shop_opts.index(s)] for s in sel_shops]
-                if sel_ids: st.info(f"✅ {len(sel_ids)} shop(s): {', '.join(sel_ids)}")
+                if sel_ids:
+                    st.info(f"✅ {len(sel_ids)} shop(s): {', '.join(sel_ids)}")
             else:
-                st.warning("No customers onboarded yet.")
+                st.warning("No customers onboarded yet."); sel_ids=[]
             if st.button("✅ Create Trip", type="primary", key="tr_btn"):
-                if not tr_id:        st.error("Trip ID required.")
-                elif not sel_ids:    st.error("Select at least one shop.")
+                if not tr_id: st.error("Trip ID required.")
+                elif not sel_ids: st.error("Select at least one shop.")
                 elif col_exists("trips","Trip ID",tr_id): st.error("Trip ID already exists.")
                 else:
                     append_row("trips",[tr_id,str(tr_date),tr_city,",".join(sel_ids),
@@ -624,12 +647,15 @@ def page_admin():
         else:
             st.info("No trips yet.")
 
+    # TAB 2 — Assign Drivers
     with tabs[2]:
         st.markdown(sl("🚚 Assign Drivers to Trips"), unsafe_allow_html=True)
-        all_d=all_drivers(); act_d=active_drivers(); trips_df=read_sheet("trips")
+        all_d    = all_drivers()
+        act_d    = active_drivers()
+        trips_df = read_sheet("trips")
         st.markdown("#### All registered drivers")
         if all_d.empty:
-            st.info("No drivers onboarded yet.")
+            st.info("No drivers onboarded yet. Use the **Driver Onboard** tab.")
         else:
             st.success(f"🟢 {len(act_d)} active  ⚫ {len(all_d)-len(act_d)} offline")
             for _,r in all_d.iterrows():
@@ -683,10 +709,12 @@ def page_admin():
                 st.success(f"✅ **{sel_drv_name}** assigned to **{sel_trip}**!")
                 st.session_state.task_done=True; st.rerun()
             st.divider()
+            st.markdown("#### All trip assignments")
             disp_t=trips_df[["Trip ID","Date","City","Driver Name","Driver UID","Status"]].copy()
             disp_t["Driver Name"]=disp_t["Driver Name"].apply(lambda v:v if str(v).strip() else "⚠️ Unassigned")
             st.dataframe(disp_t,use_container_width=True,hide_index=True)
 
+    # TAB 3 — Customers
     with tabs[3]:
         st.markdown(sl("👤 Customer Onboard Data"), unsafe_allow_html=True)
         df_c=load_customers()
@@ -698,6 +726,7 @@ def page_admin():
             c3.metric("Cities",df_c["City"].nunique())
             st.dataframe(df_c,use_container_width=True,hide_index=True)
 
+    # TAB 4 — Driver Onboard
     with tabs[4]:
         st.markdown(sl("🚗 Driver Onboard","amber"), unsafe_allow_html=True)
         all_d2=all_drivers()
@@ -706,6 +735,7 @@ def page_admin():
             m1.metric("Total drivers",len(all_d2))
             m2.metric("Active now",len(all_d2[all_d2["Active Status"]=="Active"]))
             m3.metric("Offline",len(all_d2[all_d2["Active Status"]!="Active"]))
+            st.markdown("#### All drivers")
             disp_d2=all_d2.copy()
             if "Account Number" in disp_d2.columns:
                 disp_d2["Account Number"]=disp_d2["Account Number"].apply(
@@ -733,18 +763,18 @@ def page_admin():
         st.markdown("#### Onboard new driver")
         dn1,dn2,dn3=st.columns(3)
         with dn1:
-            do_name    = st.text_input("Full name *",       key="adm_do_name")
-            do_mob     = st.text_input("Mobile *",          placeholder="10-digit", key="adm_do_mob")
-            do_email   = st.text_input("Email",             key="adm_do_email")
+            do_name    = st.text_input("Full name *",        key="adm_do_name")
+            do_mob     = st.text_input("Mobile *",           placeholder="10-digit", key="adm_do_mob")
+            do_email   = st.text_input("Email",              key="adm_do_email")
         with dn2:
             do_veh     = st.selectbox("Vehicle type",
                 ["Bike","Auto","Van","Truck","Mini-Truck"],  key="adm_do_veh")
-            do_veh_num = st.text_input("Vehicle number *",  placeholder="e.g. KA-01-AB-1234", key="adm_do_veh_num")
-            do_bank    = st.text_input("Bank name *",       key="adm_do_bank")
+            do_veh_num = st.text_input("Vehicle number *",   placeholder="e.g. KA-01-AB-1234", key="adm_do_veh_num")
+            do_bank    = st.text_input("Bank name *",        key="adm_do_bank")
         with dn3:
-            do_acct  = st.text_input("Account number *",    key="adm_do_acct")
-            do_ifsc  = st.text_input("IFSC code *",         key="adm_do_ifsc")
-            do_upi   = st.text_input("UPI ID",              placeholder="mobile@upi", key="adm_do_upi")
+            do_acct    = st.text_input("Account number *",   key="adm_do_acct")
+            do_ifsc    = st.text_input("IFSC code *",        key="adm_do_ifsc")
+            do_upi     = st.text_input("UPI ID",             placeholder="mobile@upi", key="adm_do_upi")
         st.caption("🔒 Bank details visible to admin only.")
         if st.button("✅ Onboard Driver", type="primary", use_container_width=True, key="adm_do_btn"):
             if not all([do_name,do_mob,do_veh_num,do_bank,do_acct,do_ifsc]):
@@ -762,9 +792,10 @@ def page_admin():
                         str(date.today()),"Offline",""])
                     write_admin_log(user["uid"],user.get("email",""),
                                     "ONBOARD DRIVER","Driver",did,"","",do_name)
-                    st.success(f"✅ Driver onboarded! Driver ID: **`{did}`**")
+                    st.success(f"✅ Driver onboarded! Permanent Driver ID: **`{did}`**")
                     st.session_state.task_done=True; st.rerun()
 
+    # TAB 5 — Orders
     with tabs[5]:
         st.markdown(sl("📋 All Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -781,19 +812,23 @@ def page_admin():
                 st.caption(f"Showing all {len(df_show)} order(s)")
             c1,c2,c3,c4=st.columns(4)
             c1.metric("Shown",len(df_show))
-            c2.metric("Pending",   len(df_show[df_show["Delivery Status"]=="Pending"])         if not df_show.empty else 0)
-            c3.metric("Delivered", len(df_show[df_show["Delivery Status"]=="Delivered"])       if not df_show.empty else 0)
+            c2.metric("Pending",len(df_show[df_show["Delivery Status"]=="Pending"]) if not df_show.empty else 0)
+            c3.metric("Delivered",len(df_show[df_show["Delivery Status"]=="Delivered"]) if not df_show.empty else 0)
             c4.metric("Failed/Partial",len(df_show[df_show["Delivery Status"].isin(["Failed","Partial"])]) if not df_show.empty else 0)
             if df_show.empty:
-                st.info(f"No orders for {today_str}. Tick 'Show all orders' to see history.")
+                st.info(f"No orders for {today_str}. Check 'Show all orders' to see history.")
             else:
                 st.dataframe(df_show,use_container_width=True,hide_index=True)
 
+    # TAB 6 — Audit Log
     with tabs[6]:
         st.markdown(sl("📝 Admin Audit Log","blue"), unsafe_allow_html=True)
         df_l=read_sheet("admin_log")
-        if df_l.empty: st.info("No admin actions logged yet.")
-        else: st.dataframe(df_l.sort_values("Timestamp",ascending=False),use_container_width=True,hide_index=True)
+        if df_l.empty:
+            st.info("No admin actions logged yet.")
+        else:
+            st.dataframe(df_l.sort_values("Timestamp",ascending=False),
+                         use_container_width=True,hide_index=True)
 
     st.divider()
     if not st.session_state.get("task_done",False):
@@ -825,7 +860,7 @@ def page_sales():
                 cust=(find_row("customer_onboard","CUST-ID",lk_id.strip()) if lk_id.strip()
                       else find_row("customer_onboard","Mobile",lk_mob.strip()))
             if cust:
-                st.session_state.cust_data = {k:str(v) if v is not None else "" for k,v in cust.items()}
+                st.session_state.cust_data=cust
                 st.success(f"✅ Found: **{cust.get('Full Name')}** — {cust.get('Shop Name')}")
             else:
                 st.error("❌ Customer not found. Onboard them first.")
@@ -838,9 +873,11 @@ def page_sales():
             auto_lng=str(cust.get("Longitude","")).strip()
             auto_addr=str(cust.get("Shop Address","")).strip()
             st.markdown(
-                f'<div class="loc-box">📌 <strong>Location auto-loaded from Customer Onboard Data</strong><br>'
-                f'Address: {auto_addr}<br>GPS: {auto_lat}, {auto_lng}</div>',
-                unsafe_allow_html=True)
+                f'<div class="loc-box">'
+                f'📌 <strong>Location auto-loaded from Customer Onboard Data</strong><br>'
+                f'Address: {auto_addr}<br>'
+                f'GPS: {auto_lat}, {auto_lng}'
+                f'</div>', unsafe_allow_html=True)
         st.divider()
 
         st.markdown(sl("📦 Order Details"), unsafe_allow_html=True)
@@ -854,8 +891,8 @@ def page_sales():
             ci=cities.index(auto_city) if auto_city in cities else 0
             o_city=st.selectbox("City *",cities,index=ci,key="o_city")
             st.text_input("⏰ Ordered time (auto on submit)",
-                          value=datetime.now().strftime("%H:%M:%S"),
-                          disabled=True,key="o_time_disp")
+                           value=datetime.now().strftime("%H:%M:%S"),
+                           disabled=True,key="o_time_disp")
         with oc3:
             o_dcoff=st.time_input("Delivery cut-off",key="o_dcoff")
             o_sopen=st.time_input("Shop opens at",key="o_sopen")
@@ -898,23 +935,27 @@ def page_sales():
                     f'<span style="color:#1a7f4b;font-size:1.35rem">₹{o_total:,.2f}</span></div>',
                     unsafe_allow_html=True)
             else:
-                st.info("Enter quantity to see order total.")
+                st.info("Enter quantity — order total will appear here.")
 
             st.markdown(sl("📍 Shop Location (auto from customer record)"), unsafe_allow_html=True)
             auto_addr=str(cust.get("Shop Address","")).strip() if cust else ""
             auto_lat =str(cust.get("Latitude","")).strip()     if cust else ""
             auto_lng =str(cust.get("Longitude","")).strip()    if cust else ""
 
-            o_addr=st.text_input("Shop address",value=auto_addr,key="o_addr")
+            o_addr=st.text_input("Shop address",value=auto_addr,key="o_addr",
+                                  help="Auto-filled from customer record")
             c_lat_col,c_lng_col=st.columns(2)
             with c_lat_col:
-                o_lat=st.text_input("Latitude",value=auto_lat,key="o_lat",disabled=bool(auto_lat))
+                o_lat=st.text_input("Latitude",value=auto_lat,key="o_lat",
+                                     disabled=bool(auto_lat),
+                                     help="Loaded from Customer Onboard Data")
             with c_lng_col:
-                o_lng=st.text_input("Longitude",value=auto_lng,key="o_lng",disabled=bool(auto_lng))
+                o_lng=st.text_input("Longitude",value=auto_lng,key="o_lng",
+                                     disabled=bool(auto_lng),
+                                     help="Loaded from Customer Onboard Data")
 
-            map_q=f"{auto_lat},{auto_lng}" if (auto_lat and auto_lng) else o_addr
-            if map_q.strip():
-                st.markdown(map_embed(map_q,240),unsafe_allow_html=True)
+            if auto_lat and auto_lng:
+                st.markdown(map_embed(auto_lat, auto_lng, 240), unsafe_allow_html=True)
                 st.caption("📍 Customer's registered shop location.")
 
             st.divider()
@@ -945,9 +986,11 @@ def page_sales():
                     st.success(f"✅ Order **{o_id}** submitted!  Total: **₹{o_total:,.2f}**")
                     st.session_state.cust_data={}; st.session_state.task_done=True; st.balloons()
 
-    # ── TAB 1: Onboard Customer ───────────────────────────────────────────────
+    # ── TAB 1: Customer Onboard ───────────────────────────────────────────────
     with tabs[1]:
         st.markdown(sl("👤 Customer Onboarding"), unsafe_allow_html=True)
+
+        # Search existing
         sc1,sc2=st.columns([3,1])
         with sc1: co_search=st.text_input("Search existing customer by mobile",key="co_search")
         with sc2:
@@ -961,98 +1004,84 @@ def page_sales():
                          "City":ex.get("City"),"Lat":ex.get("Latitude",""),
                          "Lng":ex.get("Longitude",""),"Status":ex.get("Status")})
             else:
-                st.info("Not found — fill form below.")
+                st.info("Not found — fill form below to onboard.")
         st.divider()
 
+        # New customer form
         st.markdown("#### New customer details")
         nc1,nc2=st.columns(2)
         with nc1:
-            co_name =st.text_input("Full name *",            key="co_name")
-            co_mob  =st.text_input("Mobile * (unique key)",  placeholder="10-digit", key="co_mob")
-            co_email=st.text_input("Email",                  key="co_email")
-            co_shop =st.text_input("Shop name *",            key="co_shop")
+            co_name =st.text_input("Full name *",           key="co_name")
+            co_mob  =st.text_input("Mobile * (unique key)", placeholder="10-digit",key="co_mob")
+            co_email=st.text_input("Email",                 key="co_email")
+            co_shop =st.text_input("Shop name *",           key="co_shop")
         with nc2:
             co_city=st.selectbox("City *",
-                ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"], key="co_city")
+                ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
-                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"], key="co_cls")
-            co_addr=st.text_input("Shop address",
-                placeholder="e.g. 12/3 MG Road, Bengaluru", key="co_addr")
+                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"],key="co_cls")
+            co_addr=st.text_input("Shop address *",
+                placeholder="e.g. 12/3 MG Road, Bengaluru",
+                key="co_addr")
 
-        # ── GPS / Location section ────────────────────────────────────────────
-        st.markdown(sl("📌 GPS Location"), unsafe_allow_html=True)
+        # ── GPS SECTION ───────────────────────────────────────────────────────
+        st.markdown(sl("📍 Shop GPS Location"), unsafe_allow_html=True)
 
-        # FIX A: Show GPS button FIRST — when it fires, the URL reloads with
-        # ?_lat=XX&_lng=YY, the top-level block writes to session_state["co_lat"]
-        # and session_state["co_lng"], and on the next render those values flow
-        # directly into the text_input widgets below via their key= lookup.
-        st.markdown("**Tap to auto-fill Latitude & Longitude from your current location:**")
-        geo_button()
+        st.markdown("**Tap the button below to capture your current location:**")
 
-        # If coords were just captured, show a confirmation banner
-        if st.session_state.get("co_lat","") and st.session_state.get("co_lng",""):
+        # The GPS component — handles query param reading + renders button
+        captured_lat, captured_lng = gps_capture_component()
+
+        # Show the captured coordinates in a styled box
+        if captured_lat and captured_lng:
             st.markdown(
-                f'<div class="gps-filled">✅ GPS captured — '
-                f'Lat: <strong>{st.session_state["co_lat"]}</strong> &nbsp;|&nbsp; '
-                f'Lng: <strong>{st.session_state["co_lng"]}</strong></div>',
-                unsafe_allow_html=True)
+                f'<div class="gps-box">'
+                f'✅ &nbsp;Location captured &nbsp;|&nbsp; '
+                f'<span style="color:#185fa5">Lat: {captured_lat}</span>'
+                f' &nbsp;|&nbsp; '
+                f'<span style="color:#185fa5">Lng: {captured_lng}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            # Show map preview using the captured coordinates
+            st.markdown(map_embed(captured_lat, captured_lng, 260), unsafe_allow_html=True)
+            st.caption(f"📍 Verify the pin is on the correct shop location. GPS: {captured_lat}, {captured_lng}")
+        else:
+            st.info("📍 Press the button above to capture your location. The map will appear here after capture.")
 
-        st.markdown("**Or enter coordinates manually** (open Google Maps → long-press on shop → copy numbers):")
-        lat_c, lng_c = st.columns(2)
-        with lat_c:
-            # KEY POINT: key="co_lat" → Streamlit reads st.session_state["co_lat"]
-            # which was set by the top-level query-param block → field shows GPS value
-            co_lat = st.text_input("Latitude *",  placeholder="e.g. 12.9716", key="co_lat")
-        with lng_c:
-            co_lng = st.text_input("Longitude *", placeholder="e.g. 77.5946", key="co_lng")
-
-        # Live map preview as soon as both fields have valid numbers
-        if co_lat.strip() and co_lng.strip():
-            try:
-                float(co_lat); float(co_lng)
-                st.markdown(
-                    f'<div class="map-frame"><iframe width="100%" height="240" frameborder="0"'
-                    f' style="border:0;display:block" allowfullscreen'
-                    f' src="https://maps.google.com/maps?q={co_lat.strip()},{co_lng.strip()}&output=embed&z=16">'
-                    f'</iframe></div>',
-                    unsafe_allow_html=True)
-                st.caption(f"📍 Showing: {co_lat.strip()}, {co_lng.strip()} — confirm the pin is on the correct shop.")
-            except ValueError:
-                st.warning("⚠️ Latitude and Longitude must be numbers (e.g. 12.9716, 77.5946).")
-
+        # ── ONBOARD BUTTON ────────────────────────────────────────────────────
         st.divider()
         if st.button("✅ Onboard Customer", type="primary", use_container_width=True, key="co_btn"):
             if not all([co_name, co_mob, co_shop, co_addr]):
                 st.error("Fill all required (*) fields.")
-            elif not co_lat.strip() or not co_lng.strip():
-                st.error("📍 Latitude and Longitude are required. Use the GPS button or enter manually.")
+            elif not captured_lat or not captured_lng:
+                st.error("📍 Location required — press 'Get My Current Location' button above first.")
             else:
-                try:
-                    float(co_lat); float(co_lng)
-                except ValueError:
-                    st.error("Latitude and Longitude must be valid numbers.")
-                    st.stop()
                 with st.spinner("Checking for duplicates…"):
-                    ex = find_row("customer_onboard","Mobile",co_mob.strip())
+                    ex = find_row("customer_onboard", "Mobile", co_mob.strip())
                 if ex:
                     st.warning(f"⚠️ Mobile already registered — CUST-ID: **{ex['CUST-ID']}**")
                 else:
                     cid = gen_cust_id()
-                    append_row("customer_onboard",[
+                    append_row("customer_onboard", [
                         cid, co_name, co_mob, co_email, co_shop,
                         co_addr, co_city, co_cls,
-                        co_lat.strip(), co_lng.strip(),
+                        captured_lat, captured_lng,
                         user["uid"], str(date.today()), "Active",
                     ])
                     load_customers.clear()
-                    # Clear GPS state so next customer starts fresh
-                    st.session_state["co_lat"] = ""
-                    st.session_state["co_lng"] = ""
-                    st.success(f"✅ Customer onboarded! CUST-ID: **`{cid}`**  |  GPS: {co_lat.strip()}, {co_lng.strip()}")
+                    # Clear GPS state after successful save
+                    st.session_state["_geo_lat"] = ""
+                    st.session_state["_geo_lng"] = ""
+                    st.success(
+                        f"✅ Customer onboarded!  "
+                        f"CUST-ID: **`{cid}`**  |  "
+                        f"GPS saved: {captured_lat}, {captured_lng}"
+                    )
                     st.session_state.task_done = True
                     st.balloons()
 
-    # ── TAB 2: My Orders ─────────────────────────────────────────────────────
+    # ── TAB 2: My Orders ──────────────────────────────────────────────────────
     with tabs[2]:
         st.markdown(sl("📋 My Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -1069,16 +1098,19 @@ def page_sales():
                     my_show=my[my["ORDER DATE"].astype(str)==today_str]
                     st.caption(f"📅 Today ({today_str}): {len(my_show)} order(s)")
                 else:
-                    my_show=my; st.caption(f"All orders: {len(my_show)}")
+                    my_show=my
+                    st.caption(f"All orders: {len(my_show)}")
+
                 tot_val=my_show["OrderTotal"].apply(
                     lambda x:float(str(x).replace("₹","").replace(",","") or 0)).sum()
                 mc1,mc2,mc3,mc4=st.columns(4)
                 mc1.metric("Shown",len(my_show))
-                mc2.metric("Pending",  len(my_show[my_show["Delivery Status"]=="Pending"])   if not my_show.empty else 0)
+                mc2.metric("Pending",len(my_show[my_show["Delivery Status"]=="Pending"]) if not my_show.empty else 0)
                 mc3.metric("Delivered",len(my_show[my_show["Delivery Status"]=="Delivered"]) if not my_show.empty else 0)
                 mc4.metric("Total value",f"₹{tot_val:,.0f}")
+
                 if my_show.empty:
-                    st.info(f"No orders today. Tick the box above to see all.")
+                    st.info(f"No orders for today ({today_str}). Check the box above to see all orders.")
                 else:
                     show_cols=[c for c in ["Order ID","Customer shop name","SKU","SKU Name",
                                            "OrderedQty","OrderTotal","ORDER DATE","ORDERED TIME",
@@ -1147,6 +1179,7 @@ def page_delivery():
             order=trip_ord.get(sid)
             is_done=bool(order and str(order.get("Delivery Status","")) not in ("Pending",""))
             is_cur =(i==active_idx) and not is_done
+            is_lock=i>active_idx
             icon="✅" if is_done else ("📍" if is_cur else "🔒")
             stat=order.get("Delivery Status","Pending") if order else "No order"
             p_cls="pill-done" if is_done else ("pill-pend" if is_cur else "pill-off")
@@ -1163,12 +1196,11 @@ def page_delivery():
                 with r2:
                     st.markdown(pill(stat,p_cls),unsafe_allow_html=True)
 
-            if is_cur:
+            if is_cur and not is_lock:
                 if shop:
                     lat=str(shop.get("Latitude","")); lng=str(shop.get("Longitude",""))
-                    shop_addr=shop.get("Shop Address","")
-                    map_q=f"{lat},{lng}" if (lat.strip() and lng.strip()) else shop_addr
-                    if map_q.strip(): st.markdown(map_embed(map_q,200),unsafe_allow_html=True)
+                    if lat.strip() and lng.strip():
+                        st.markdown(map_embed(lat, lng, 200), unsafe_allow_html=True)
                 with st.form(key=f"del_form_{i}"):
                     st.markdown("##### ✍️ Update delivery")
                     df1,df2,df3=st.columns(3)
@@ -1220,7 +1252,7 @@ def page_delivery():
             else:
                 my_h_show=my_h
             if my_h_show.empty:
-                st.info("No completed deliveries for today. Tick the box to see all history.")
+                st.info("No completed deliveries for today. Check the box to see all history.")
             else:
                 show_cols=[c for c in ["Order ID","Customer shop name","SKU","SKU Name",
                            "OrderedQty","OrderTotal","Delivery Status",
@@ -1245,7 +1277,7 @@ if not os.path.exists(creds_path):
         get_gspread_client()
     except Exception as e:
         st.error(f"❌ Cannot connect to Google Sheets: {e}")
-        st.info("Add credentials to Streamlit Cloud Secrets under `[gcp_service_account]`.")
+        st.info("Add your Google credentials to Streamlit Cloud **Secrets** under `[gcp_service_account]`.")
         if st.button("🔄 Retry connection"):
             _cached_client.clear(); st.rerun()
         st.stop()
@@ -1262,4 +1294,3 @@ else:
         if st.button("Logout"):
             for k in DEFAULTS: st.session_state[k]=DEFAULTS[k]
             st.rerun()
-            
