@@ -79,11 +79,13 @@ DEFAULTS = {
     "driver_id": None,  "driver_active": True,
     "active_stop": 0,   "cust_data": {},
     "task_done": False,
-    "_geo_lat": "", "_geo_lng": "",
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+# GPS coords kept separate — must survive reruns, cleared only after successful save
+if "_geo_lat" not in st.session_state: st.session_state["_geo_lat"] = ""
+if "_geo_lng" not in st.session_state: st.session_state["_geo_lng"] = ""
 
 ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
 
@@ -340,89 +342,100 @@ def map_embed(lat, lng, height=260):
 # ── GPS COMPONENT ─────────────────────────────────────────────────────────────
 def gps_capture_component():
     """
-    Single GPS button component.
-    - Reads _lat/_lng from query params if browser redirected back after GPS capture.
-    - Renders the HTML button that triggers geolocation and redirects with coords.
-    - Returns (lat_str, lng_str) from session state.
+    GPS capture using Streamlit's query_params.
+    Uses window.parent.location.href approach (reliable cross-browser).
+    On return from GPS redirect, saves to session_state and reruns.
+    Returns (lat_str, lng_str) — empty strings if not yet captured.
     """
-    # Step 1: On page load, check if query params contain GPS coords from previous capture
+    # ── Read coords injected by the GPS redirect ──────────────────────────────
     qp = st.query_params
-    if "_lat" in qp and "_lng" in qp:
+    if "gps_lat" in qp and "gps_lng" in qp:
         try:
-            lat = float(qp["_lat"])
-            lng = float(qp["_lng"])
-            st.session_state["_geo_lat"] = f"{lat:.6f}"
-            st.session_state["_geo_lng"] = f"{lng:.6f}"
+            st.session_state["_geo_lat"] = f"{float(qp['gps_lat']):.6f}"
+            st.session_state["_geo_lng"] = f"{float(qp['gps_lng']):.6f}"
         except Exception:
             pass
-        # Clean URL — remove GPS params then rerun cleanly
-        del qp["_lat"]
-        del qp["_lng"]
+        # Wipe the query params so they don't re-fire on the next rerun
+        st.query_params.clear()
         st.rerun()
 
     cur_lat = st.session_state.get("_geo_lat", "")
     cur_lng = st.session_state.get("_geo_lng", "")
 
-    # Step 2: Render the GPS button HTML component
-    geo_html = f"""
+    # ── Render GPS button ─────────────────────────────────────────────────────
+    # Uses a hidden form that submits to the SAME URL with ?gps_lat=…&gps_lng=…
+    # appended — no page-reload iframe hack needed; Streamlit's query_param
+    # watcher picks it up on the very next script run.
+    geo_html = """
 <!DOCTYPE html>
 <html>
-<body style="margin:0;padding:0;background:transparent;font-family:sans-serif">
+<body style="margin:0;padding:4px 0;background:transparent;font-family:'DM Sans',sans-serif">
 
-<button id="gbtn" onclick="doGeo()"
-  style="background:#1a7f4b;color:#fff;border:none;padding:11px 24px;
+<button id="gbtn" onclick="doGeo(event)"
+  style="background:#1a7f4b;color:#fff;border:none;padding:12px 28px;
          border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;
-         display:flex;align-items:center;gap:8px;box-shadow:0 4px 12px rgba(26,127,75,.3)">
+         box-shadow:0 4px 14px rgba(26,127,75,.35);letter-spacing:.3px">
   📍 Get My Current Location
 </button>
-<div id="gstat" style="margin-top:8px;font-size:13px;color:#1a7f4b;font-weight:600;min-height:20px"></div>
+
+<div id="gstat"
+  style="margin-top:10px;font-size:13px;font-weight:600;min-height:22px;
+         padding:6px 10px;border-radius:8px;display:none">
+</div>
 
 <script>
-function doGeo() {{
-  var s = document.getElementById('gstat');
-  var b = document.getElementById('gbtn');
-  b.disabled = true;
-  b.style.opacity = '0.7';
-  s.innerHTML = '⏳ Getting your location…';
-  s.style.color = '#854f0b';
+function doGeo(e) {
+  e.preventDefault();
+  var s  = document.getElementById('gstat');
+  var b  = document.getElementById('gbtn');
 
-  if (!navigator.geolocation) {{
-    s.innerHTML = '❌ Geolocation is not supported by this browser.';
-    s.style.color = '#842029';
+  function show(msg, color, bg) {
+    s.innerHTML   = msg;
+    s.style.color      = color;
+    s.style.background = bg;
+    s.style.display    = 'block';
+  }
+
+  b.disabled     = true;
+  b.style.opacity = '0.65';
+  show('⏳ Getting your location…', '#854f0b', '#fff8e1');
+
+  if (!navigator.geolocation) {
+    show('❌ Geolocation not supported by this browser.', '#842029', '#fde8e8');
     b.disabled = false; b.style.opacity = '1';
     return;
-  }}
+  }
 
   navigator.geolocation.getCurrentPosition(
-    function(pos) {{
+    function(pos) {
       var lat = pos.coords.latitude.toFixed(6);
       var lng = pos.coords.longitude.toFixed(6);
-      s.innerHTML = '✅ Location captured: ' + lat + ', ' + lng + '<br><small style="color:#5a7a65">Updating fields…</small>';
-      s.style.color = '#1a7f4b';
-      // Write coords to parent URL → triggers Streamlit rerun which fills the fields
+      show('✅ Got: ' + lat + ', ' + lng + ' — saving…', '#1a7f4b', '#e8f5e9');
+
+      // Append coords as query params to the PARENT window URL, then navigate.
+      // Streamlit sees them on next script run via st.query_params.
       var url = new URL(window.parent.location.href);
-      url.searchParams.set('_lat', lat);
-      url.searchParams.set('_lng', lng);
+      url.searchParams.set('gps_lat', lat);
+      url.searchParams.set('gps_lng', lng);
       window.parent.location.href = url.toString();
-    }},
-    function(err) {{
-      var msgs = {{
-        1: '❌ Permission denied — please allow location access in your browser settings.',
-        2: '❌ Position unavailable — try again.',
-        3: '❌ Request timed out — try again.'
-      }};
-      s.innerHTML = msgs[err.code] || '❌ ' + err.message;
-      s.style.color = '#842029';
+    },
+    function(err) {
+      var msgs = {
+        1: '❌ Permission denied — allow location in browser settings and retry.',
+        2: '❌ Position unavailable — check GPS signal and retry.',
+        3: '❌ Timed out — move to open area and retry.'
+      };
+      show(msgs[err.code] || ('❌ Error: ' + err.message), '#842029', '#fde8e8');
       b.disabled = false; b.style.opacity = '1';
-    }},
-    {{enableHighAccuracy: true, timeout: 15000, maximumAge: 0}}
+    },
+    {enableHighAccuracy: true, timeout: 20000, maximumAge: 0}
   );
-}}
+}
 </script>
 </body>
 </html>
 """
-    st.components.v1.html(geo_html, height=90, scrolling=False)
+    st.components.v1.html(geo_html, height=100, scrolling=False)
     return cur_lat, cur_lng
 
 
@@ -1019,7 +1032,7 @@ def page_sales():
             co_city=st.selectbox("City *",
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
-                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"],key="co_cls")
+                ["A","B","C","Premium","Wholesale","Retail"],key="co_cls")
             co_addr=st.text_input("Shop address *",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr")
