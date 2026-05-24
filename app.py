@@ -1017,8 +1017,8 @@ def page_sales():
             co_city=st.selectbox("City *",
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
-                ["A","B","C","Premium","Wholesale","Retail"],key="co_cls")
-            co_addr=st.text_input("Shop address *",
+                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail"],key="co_cls")
+            co_addr=st.text_input("Shop address",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr",
                 help="Type the shop address — plain text, no map search needed")
