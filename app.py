@@ -1,11 +1,10 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Garlic Order & Delivery Platform  —  app.py  v8                           ║
-# ║  Fixes in this version:                                                    ║
-# ║   FIX E: Customer details properly shown after fetch (session_state keys)  ║
-# ║   FIX F: Shop location (lat/lng) correctly saved to Base sheet             ║
-# ║   FIX G: Ordered time removed as input — auto-captured at submit moment    ║
-# ║   FIX H: GPS button uses postMessage → st.query_params (no page reload)    ║
-# ║   FIX I: GPS map preview shown immediately after coordinates captured      ║
+# ║  Garlic Order & Delivery Platform  —  app.py  v9                           ║
+# ║  v8 + FIX J: Live location via streamlit-js-eval get_geolocation()         ║
+# ║   • Replaces iframe/redirect GPS hack with proper bidirectional component  ║
+# ║   • No page reload, no loop — returns coords directly to Python            ║
+# ║   • Requires:  pip install streamlit-js-eval                               ║
+# ║     (add  streamlit-js-eval  to requirements.txt)                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 import os, uuid, textwrap
 from datetime import datetime, date
@@ -14,6 +13,13 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+
+# FIX J: streamlit-js-eval for live geolocation (add to requirements.txt)
+try:
+    from streamlit_js_eval import get_geolocation
+    _GEO_AVAILABLE = True
+except ImportError:
+    _GEO_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -84,9 +90,9 @@ DEFAULTS = {
     "driver_id":   None,   "driver_active": True,
     "active_stop": 0,      "cust_data":    {},
     "task_done":   False,
-    # GPS state — set by the GPS postMessage listener
-    "gps_lat": "", "gps_lng": "",
-    "gps_prefix_done": "",   # tracks which widget last wrote GPS
+    # FIX J: live location state
+    "live_lat": "",  "live_lng": "",  "live_acc": "",
+    "loc_fetching": False,   # True while awaiting geolocation response
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
@@ -387,94 +393,86 @@ def autofill_box(label, value):
             f'<div style="font-size:.95rem;font-weight:500;color:#1a2e22">{val}</div>'
             f'</div>')
 
-# ─── FIX H: GPS widget using postMessage (no page reload, no URL change) ──────
-def gps_widget(prefix: str, height: int = 110):
+# ─── FIX J: Live location via streamlit-js-eval (proper bidirectional) ────────
+def live_location_widget():
     """
-    Renders a GPS capture button inside an iframe component.
-    The JS uses window.parent.postMessage to send coords back.
-    A sibling <script> in the MAIN page listens and writes to
-    Streamlit's query_params via a hidden form trick.
+    Uses get_geolocation() from streamlit-js-eval.
+    - Renders a "📡 Fetch Live Location" button.
+    - When clicked, the browser Geolocation API fires immediately.
+    - Coordinates come back directly to Python — no redirect, no loop.
+    - Stores result in st.session_state.live_lat / live_lng / live_acc.
+    - Returns (lat_str, lng_str, accuracy_str).
 
-    Returns (lat_str, lng_str) — empty strings if not yet captured.
+    Fallback: if streamlit-js-eval is not installed, shows a manual input pair.
     """
-    # Check if coords arrived via query_params (set by the redirect fallback)
-    qp = st.query_params
-    pk_lat, pk_lng = f"{prefix}_lat", f"{prefix}_lng"
-    if pk_lat in qp and pk_lng in qp:
-        st.session_state.gps_lat = str(qp[pk_lat])
-        st.session_state.gps_lng = str(qp[pk_lng])
-        st.session_state.gps_prefix_done = prefix
-        del qp[pk_lat]; del qp[pk_lng]
+    if not _GEO_AVAILABLE:
+        st.warning("⚠️ `streamlit-js-eval` not installed. Add it to requirements.txt. "
+                   "Falling back to manual entry.")
+        fb1, fb2 = st.columns(2)
+        with fb1:
+            fb_lat = st.text_input("Latitude",  placeholder="e.g. 12.9716", key="fb_lat")
+        with fb2:
+            fb_lng = st.text_input("Longitude", placeholder="e.g. 77.5946", key="fb_lng")
+        return fb_lat.strip(), fb_lng.strip(), ""
 
-    cur_lat = st.session_state.get("gps_lat","")
-    cur_lng = st.session_state.get("gps_lng","")
+    # ── Button to trigger fetch ───────────────────────────────────────────────
+    already_have = (st.session_state.get("live_lat","") and
+                    st.session_state.get("live_lng",""))
 
-    # The iframe HTML — uses window.location redirect as the reliable trigger
-    # (postMessage across Streamlit's iframe boundary is blocked by sandbox)
-    # We build the redirect URL pointing back to the same page with query params.
-    gps_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-  body {{ margin:0; padding:0; background:transparent; font-family:sans-serif; }}
-  #btn {{
-    background:#185fa5; color:#fff; border:none; padding:10px 22px;
-    border-radius:10px; font-size:.88rem; font-weight:700; cursor:pointer;
-    display:flex; align-items:center; gap:8px; box-shadow:0 3px 10px rgba(24,95,165,.28);
-    transition:opacity .2s;
-  }}
-  #btn:disabled {{ opacity:.55; cursor:not-allowed; }}
-  #msg {{ font-size:.78rem; margin-top:6px; min-height:1.1rem; color:#5a7a65; }}
-</style>
-</head>
-<body>
-<button id="btn" onclick="go()">📍 Take GPS Location (Current Device)</button>
-<div id="msg"></div>
-<script>
-function go() {{
-  var b = document.getElementById('btn');
-  var m = document.getElementById('msg');
-  if (!navigator.geolocation) {{
-    m.style.color='#842029';
-    m.innerText='❌ Geolocation not supported by this browser.';
-    return;
-  }}
-  b.disabled = true;
-  b.innerText = '⏳ Fetching GPS…';
-  m.innerText = 'Requesting location from device…';
-  navigator.geolocation.getCurrentPosition(
-    function(pos) {{
-      var lat = pos.coords.latitude.toFixed(7);
-      var lng = pos.coords.longitude.toFixed(7);
-      m.style.color = '#1a7f4b';
-      m.innerText = '✅ Got: ' + lat + ', ' + lng + ' — loading…';
-      // Redirect parent window with query params → triggers Streamlit rerun
-      var url = new URL(window.parent.location.href);
-      url.searchParams.set('{prefix}_lat', lat);
-      url.searchParams.set('{prefix}_lng', lng);
-      window.parent.location.href = url.toString();
-    }},
-    function(err) {{
-      b.disabled = false;
-      b.innerText = '📍 Take GPS Location (Current Device)';
-      var msgs = {{
-        1:'Permission denied — please allow location access.',
-        2:'Position unavailable — check GPS/WiFi.',
-        3:'Timeout — please try again.'
-      }};
-      m.style.color = '#842029';
-      m.innerText = '❌ ' + (msgs[err.code] || err.message);
-    }},
-    {{enableHighAccuracy:true, timeout:15000, maximumAge:0}}
-  );
-}}
-</script>
-</body>
-</html>
-"""
-    st.components.v1.html(gps_html, height=height, scrolling=False)
-    return cur_lat, cur_lng
+    btn_label = "🔄 Re-fetch Live Location" if already_have else "📡 Fetch Live Location"
+
+    st.markdown(f"""
+<div style="margin-bottom:6px">
+  <span style="font-size:.82rem;color:#5a7a65">
+    Tap the button — your browser will request permission, then pinpoint your current location.
+  </span>
+</div>""", unsafe_allow_html=True)
+
+    fetch = st.button(btn_label, key="loc_fetch_btn",
+                      help="Uses your device GPS / WiFi to get precise coordinates.")
+
+    if fetch:
+        # Clear previous so the component re-fires
+        st.session_state.live_lat = ""
+        st.session_state.live_lng = ""
+        st.session_state.live_acc = ""
+        st.session_state.loc_fetching = True
+
+    # ── Call get_geolocation only while fetching ──────────────────────────────
+    if st.session_state.get("loc_fetching", False):
+        with st.spinner("📡 Contacting your device GPS…"):
+            loc = get_geolocation()   # blocks until browser responds
+
+        if loc and isinstance(loc, dict):
+            coords = loc.get("coords", {})
+            lat = coords.get("latitude")
+            lng = coords.get("longitude")
+            acc = coords.get("accuracy")
+            if lat is not None and lng is not None:
+                st.session_state.live_lat     = f"{lat:.7f}"
+                st.session_state.live_lng     = f"{lng:.7f}"
+                st.session_state.live_acc     = f"{acc:.1f}" if acc is not None else ""
+                st.session_state.loc_fetching = False
+                st.rerun()   # refresh so the map renders
+            else:
+                st.session_state.loc_fetching = False
+                st.error("❌ Location received but coordinates missing. Try again.")
+        else:
+            st.session_state.loc_fetching = False
+            st.error("❌ Could not get location. Allow location access in your browser and retry.")
+
+    # ── Show result ───────────────────────────────────────────────────────────
+    cur_lat = st.session_state.get("live_lat", "")
+    cur_lng = st.session_state.get("live_lng", "")
+    cur_acc = st.session_state.get("live_acc", "")
+
+    if cur_lat and cur_lng:
+        acc_txt = f" · accuracy ±{cur_acc} m" if cur_acc else ""
+        st.success(f"✅ Live location captured: **{cur_lat}**, **{cur_lng}**{acc_txt}")
+        st.markdown(map_embed_coords(cur_lat, cur_lng, 230), unsafe_allow_html=True)
+        st.caption("🗺️ Confirm the pin is on your shop before saving.")
+
+    return cur_lat, cur_lng, cur_acc
 
 
 def topbar(role_label, role_color="#1a7f4b"):
@@ -1005,46 +1003,41 @@ def page_sales():
         # Address map preview
         if co_addr and co_addr.strip():
             st.markdown(map_embed(co_addr, 200), unsafe_allow_html=True)
-            st.caption("📍 Address-based preview — confirm with GPS below for exact pin.")
+            st.caption("📍 Address-based preview — capture live location below for an exact GPS pin.")
 
-        # ── GPS Section ───────────────────────────────────────────────────────
-        st.markdown(sl("📍 GPS Coordinates"), unsafe_allow_html=True)
-        st.markdown("Enter manually **or** tap **Take GPS Location** to capture current device position:")
+        # ── FIX J: Live Location Section ──────────────────────────────────────
+        st.markdown(sl("📡 Live Location"), unsafe_allow_html=True)
 
+        # Manual override columns — shown above the fetch button
+        # so SE can also type coordinates if device GPS is unavailable
         g1, g2 = st.columns(2)
         with g1:
-            # FIX H: value reads from session state so GPS result auto-populates
-            co_lat = st.text_input("Latitude",  placeholder="e.g. 12.9716",
-                                   value=st.session_state.get("gps_lat",""),
-                                   key="co_lat",
-                                   help="Auto-filled by GPS button")
+            co_lat_manual = st.text_input("Latitude (manual override)",
+                                          placeholder="e.g. 12.9716", key="co_lat_manual",
+                                          help="Leave blank to use Live Location button below")
         with g2:
-            co_lng = st.text_input("Longitude", placeholder="e.g. 77.5946",
-                                   value=st.session_state.get("gps_lng",""),
-                                   key="co_lng",
-                                   help="Auto-filled by GPS button")
+            co_lng_manual = st.text_input("Longitude (manual override)",
+                                          placeholder="e.g. 77.5946", key="co_lng_manual",
+                                          help="Leave blank to use Live Location button below")
 
-        # FIX H: GPS widget — uses iframe redirect approach
-        gps_lat_raw, gps_lng_raw = gps_widget("co", height=100)
+        # Live location widget — button + spinner + map preview
+        live_lat, live_lng, live_acc = live_location_widget()
 
-        # Resolve: if session state has something (from GPS capture), use it;
-        # otherwise fall back to what the user typed
-        final_lat = st.session_state.get("gps_lat","").strip() or co_lat.strip()
-        final_lng = st.session_state.get("gps_lng","").strip() or co_lng.strip()
+        # Priority: manual entry overrides live if the SE typed something
+        final_lat = co_lat_manual.strip() or live_lat
+        final_lng = co_lng_manual.strip() or live_lng
 
-        # FIX I: show GPS map preview immediately when coordinates are available
-        if final_lat and final_lng:
-            st.success(f"📍 Coordinates ready: **{final_lat}**, **{final_lng}**")
-            st.markdown(map_embed_coords(final_lat, final_lng, 220), unsafe_allow_html=True)
-            st.caption("🗺️ GPS pin preview — this location will be saved with the customer record.")
-        elif co_lat.strip() and co_lng.strip():
-            st.markdown(map_embed_coords(co_lat.strip(), co_lng.strip(), 220), unsafe_allow_html=True)
+        # Show manual-entry map only when manually typed AND live not captured
+        if co_lat_manual.strip() and co_lng_manual.strip() and not live_lat:
+            st.markdown(map_embed_coords(co_lat_manual.strip(), co_lng_manual.strip(), 210),
+                        unsafe_allow_html=True)
+            st.caption(f"📍 Manual coordinates: {co_lat_manual.strip()}, {co_lng_manual.strip()}")
 
         if st.button("✅ Onboard Customer",type="primary",use_container_width=True,key="co_btn"):
             if not all([co_name.strip(),co_mob.strip(),co_shop.strip(),co_addr.strip()]):
                 st.error("Fill all required (*) fields.")
             elif not final_lat or not final_lng:
-                st.error("📍 Latitude and Longitude required. Use GPS button or enter manually.")
+                st.error("📍 Location required. Tap 'Fetch Live Location' or enter coordinates manually.")
             else:
                 with st.spinner("Checking duplicates…"):
                     ex = find_row("customer_onboard","Mobile",co_mob.strip())
@@ -1059,10 +1052,11 @@ def page_sales():
                         final_lat, final_lng,
                     ])
                     load_customers.clear()
-                    # Clear GPS after save
-                    st.session_state.gps_lat = ""
-                    st.session_state.gps_lng = ""
-                    st.success(f"✅ Onboarded! CUST-ID: **`{cid}`**")
+                    # Clear live location after successful save
+                    st.session_state.live_lat = ""
+                    st.session_state.live_lng = ""
+                    st.session_state.live_acc = ""
+                    st.success(f"✅ Onboarded! CUST-ID: **`{cid}`** · Saved at {final_lat}, {final_lng}")
                     st.session_state.task_done = True
                     st.balloons()
 
