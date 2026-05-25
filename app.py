@@ -358,7 +358,7 @@ def gps_capture_component():
 
     if st.session_state.get("_gps_requested", False) and not (cur_lat and cur_lng):
         st.info("⏳ Requesting location access from your browser…")
-        loc = get_geolocation(key="gps_geolocation")
+        loc = get_geolocation()
         if loc and isinstance(loc, dict) and "coords" in loc:
             c = loc["coords"]
             st.session_state["_geo_lat"] = f"{float(c['latitude']):.6f}"
@@ -964,7 +964,7 @@ def page_sales():
             co_city=st.selectbox("City *",
                 ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="co_city")
             co_cls =st.selectbox("Classification",
-                ["A","B","C","Premium","Wholesale","Retail"],key="co_cls")
+                ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"],key="co_cls")
             co_addr=st.text_input("Shop address *",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
                 key="co_addr")
