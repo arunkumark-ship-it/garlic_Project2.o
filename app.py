@@ -1,10 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Garlic Order & Delivery Platform  —  app.py  FINAL v7                     ║
-# ║  NEW FIXES:                                                                 ║
-# ║  FIX A: Customer onboard — "Get My Location" button fills Lat/Long via JS  ║
-# ║  FIX B: Order fetch — auto-fills all fields incl. Lat/Long from onboard    ║
-# ║  FIX C: Driver onboard — Vehicle Number field added                        ║
-# ║  FIX D: Orders page — shows only TODAY's orders by default                 ║
+# ║  Garlic Order & Delivery Platform  —  app.py  FINAL v8                     ║
+# ║  GPS FIX: Single "Get My Location" button → auto-fills Lat/Long            ║
+# ║           → shows map preview → saves to sheet                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 import os, uuid, textwrap
 from datetime import datetime, date
@@ -55,6 +52,10 @@ header[data-testid="stHeader"]{ background:transparent; }
   background:#e6f1fb; border:1px solid #b5d4f4; border-radius:10px;
   padding:10px 14px; margin:6px 0; font-size:13px;
 }
+.gps-box{
+  background:#e8f5e9; border:2px solid #1a7f4b; border-radius:12px;
+  padding:12px 16px; margin:8px 0; font-size:14px; font-weight:600; color:#0d1f14;
+}
 div[data-testid="stTextInput"] input,
 div[data-testid="stSelectbox"] select,
 div[data-testid="stNumberInput"] input,
@@ -78,12 +79,13 @@ DEFAULTS = {
     "driver_id": None,  "driver_active": True,
     "active_stop": 0,   "cust_data": {},
     "task_done": False,
-    # FIX A: store captured lat/lng in session
-    "geo_lat": "", "geo_lng": "", "geo_captured": False,
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+# GPS coords kept separate — must survive reruns, cleared only after successful save
+if "_geo_lat" not in st.session_state: st.session_state["_geo_lat"] = ""
+if "_geo_lng" not in st.session_state: st.session_state["_geo_lng"] = ""
 
 ADMIN_REGISTER_PASSWORD = st.secrets.get("admin_register_password", "Admin@123")
 
@@ -145,7 +147,6 @@ TAB = {
 }
 
 HEADERS = {
-    # FIX B: Added Latitude + Longitude columns to Base sheet
     "base": [
         "Order ID","SOID","City","ORDER DATE","DELIVERED DATE","ORDERED TIME",
         "CustomerId","Customer shop name","Customer Number","Customer_Classification",
@@ -156,13 +157,11 @@ HEADERS = {
         "Shop Location","Latitude","Longitude",
         "Delivery Status","EnteredBy_UID","Timestamp",
     ],
-    # FIX A: Lat + Long in customer_onboard
     "customer_onboard": [
         "CUST-ID","Full Name","Mobile","Email","Shop Name","Shop Address",
         "City","Classification","Latitude","Longitude",
         "Onboarded By","Onboard Date","Status",
     ],
-    # FIX C: Added Vehicle Number to driver_onboard
     "driver_onboard": [
         "Driver ID","Full Name","Mobile","Email","Vehicle Type","Vehicle Number",
         "Bank Name","Account Number","IFSC Code","UPI ID",
@@ -204,7 +203,6 @@ def get_ws(key: str):
         ws = sp.add_worksheet(title=name, rows=2000, cols=50)
         if key in HEADERS: ws.append_row(HEADERS[key])
         return ws
-    # Auto-migrate: add any missing columns
     if key in HEADERS:
         expected = HEADERS[key]
         current  = ws.row_values(1)
@@ -333,85 +331,113 @@ def sl(label, color=""):
 def pill(text, cls="pill-pend"):
     return f'<span class="pill {cls}">{text}</span>'
 
-def map_embed(query, height=260):
-    q = str(query).strip()
-    if not q: return ""
-    enc = q.replace(" ","+")
+def map_embed(lat, lng, height=260):
+    """Embed Google Map using lat/lng coordinates."""
+    if not lat or not lng: return ""
     return (f'<div class="map-frame"><iframe width="100%" height="{height}"'
             f' frameborder="0" style="border:0;display:block" allowfullscreen'
-            f' src="https://maps.google.com/maps?q={enc}&output=embed&z=15">'
+            f' src="https://maps.google.com/maps?q={lat},{lng}&output=embed&z=16">'
             f'</iframe></div>')
 
-# GPS location via query-params (reliable cross-browser approach)
-def geo_location_button():
+# ── GPS COMPONENT ─────────────────────────────────────────────────────────────
+def gps_capture_component():
     """
-    GPS capture using HTML component + query params to pass coords back to Streamlit.
-    Works on mobile Chrome/Safari and desktop browsers.
-    Reads result from st.query_params["_lat"] and "_lng".
+    GPS capture using Streamlit's query_params.
+    Uses window.parent.location.href approach (reliable cross-browser).
+    On return from GPS redirect, saves to session_state and reruns.
+    Returns (lat_str, lng_str) — empty strings if not yet captured.
     """
-    # Read any previously captured coords from query params
+    # ── Read coords injected by the GPS redirect ──────────────────────────────
     qp = st.query_params
-    if "_lat" in qp and "_lng" in qp:
+    if "gps_lat" in qp and "gps_lng" in qp:
         try:
-            lat = float(qp["_lat"]); lng = float(qp["_lng"])
-            st.session_state["_geo_lat"] = f"{lat:.6f}"
-            st.session_state["_geo_lng"] = f"{lng:.6f}"
+            st.session_state["_geo_lat"] = f"{float(qp['gps_lat']):.6f}"
+            st.session_state["_geo_lng"] = f"{float(qp['gps_lng']):.6f}"
         except Exception:
             pass
-        # Clean up query params
-        del qp["_lat"]; del qp["_lng"]
+        # Wipe the query params so they don't re-fire on the next rerun
+        st.query_params.clear()
         st.rerun()
 
     cur_lat = st.session_state.get("_geo_lat", "")
     cur_lng = st.session_state.get("_geo_lng", "")
 
-    # Build the JS component — on click it writes coords to URL then reloads
+    # ── Render GPS button ─────────────────────────────────────────────────────
+    # Uses a hidden form that submits to the SAME URL with ?gps_lat=…&gps_lng=…
+    # appended — no page-reload iframe hack needed; Streamlit's query_param
+    # watcher picks it up on the very next script run.
     geo_html = """
-<!DOCTYPE html><html><body style="margin:0;padding:0;background:transparent">
-<button id="gbtn"
-  onclick="doGeo()"
-  style="background:#185fa5;color:#fff;border:none;padding:9px 20px;
-         border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;
-         font-family:sans-serif">
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:4px 0;background:transparent;font-family:'DM Sans',sans-serif">
+
+<button id="gbtn" onclick="doGeo(event)"
+  style="background:#1a7f4b;color:#fff;border:none;padding:12px 28px;
+         border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;
+         box-shadow:0 4px 14px rgba(26,127,75,.35);letter-spacing:.3px">
   📍 Get My Current Location
 </button>
-<span id="gstat" style="font-size:12px;color:#5a7a65;margin-left:10px;font-family:sans-serif"></span>
+
+<div id="gstat"
+  style="margin-top:10px;font-size:13px;font-weight:600;min-height:22px;
+         padding:6px 10px;border-radius:8px;display:none">
+</div>
+
 <script>
-function doGeo(){
-  var s = document.getElementById('gstat');
-  var b = document.getElementById('gbtn');
-  b.disabled = true;
-  s.textContent = '⏳ Getting location…';
-  if(!navigator.geolocation){
-    s.textContent = '❌ Geolocation not supported by this browser.';
-    b.disabled = false; return;
+function doGeo(e) {
+  e.preventDefault();
+  var s  = document.getElementById('gstat');
+  var b  = document.getElementById('gbtn');
+
+  function show(msg, color, bg) {
+    s.innerHTML   = msg;
+    s.style.color      = color;
+    s.style.background = bg;
+    s.style.display    = 'block';
   }
+
+  b.disabled     = true;
+  b.style.opacity = '0.65';
+  show('⏳ Getting your location…', '#854f0b', '#fff8e1');
+
+  if (!navigator.geolocation) {
+    show('❌ Geolocation not supported by this browser.', '#842029', '#fde8e8');
+    b.disabled = false; b.style.opacity = '1';
+    return;
+  }
+
   navigator.geolocation.getCurrentPosition(
-    function(pos){
+    function(pos) {
       var lat = pos.coords.latitude.toFixed(6);
       var lng = pos.coords.longitude.toFixed(6);
-      s.textContent = '✅ Got: ' + lat + ', ' + lng;
-      // Write to parent URL so Streamlit can read via st.query_params
+      show('✅ Got: ' + lat + ', ' + lng + ' — saving…', '#1a7f4b', '#e8f5e9');
+
+      // Append coords as query params to the PARENT window URL, then navigate.
+      // Streamlit sees them on next script run via st.query_params.
       var url = new URL(window.parent.location.href);
-      url.searchParams.set('_lat', lat);
-      url.searchParams.set('_lng', lng);
+      url.searchParams.set('gps_lat', lat);
+      url.searchParams.set('gps_lng', lng);
       window.parent.location.href = url.toString();
     },
-    function(err){
-      var msgs = {1:'Permission denied — allow location in browser settings.',
-                  2:'Position unavailable — try again.',
-                  3:'Timed out — try again.'};
-      s.textContent = '❌ ' + (msgs[err.code] || err.message);
-      b.disabled = false;
+    function(err) {
+      var msgs = {
+        1: '❌ Permission denied — allow location in browser settings and retry.',
+        2: '❌ Position unavailable — check GPS signal and retry.',
+        3: '❌ Timed out — move to open area and retry.'
+      };
+      show(msgs[err.code] || ('❌ Error: ' + err.message), '#842029', '#fde8e8');
+      b.disabled = false; b.style.opacity = '1';
     },
-    {enableHighAccuracy:true, timeout:15000, maximumAge:0}
+    {enableHighAccuracy: true, timeout: 20000, maximumAge: 0}
   );
 }
 </script>
-</body></html>
+</body>
+</html>
 """
-    st.components.v1.html(geo_html, height=48, scrolling=False)
+    st.components.v1.html(geo_html, height=100, scrolling=False)
     return cur_lat, cur_lng
+
 
 def topbar(role_label, role_color="#1a7f4b"):
     user = st.session_state.user
@@ -713,7 +739,7 @@ def page_admin():
             c3.metric("Cities",df_c["City"].nunique())
             st.dataframe(df_c,use_container_width=True,hide_index=True)
 
-    # TAB 4 — Driver Onboard (FIX C: Vehicle Number field added)
+    # TAB 4 — Driver Onboard
     with tabs[4]:
         st.markdown(sl("🚗 Driver Onboard","amber"), unsafe_allow_html=True)
         all_d2=all_drivers()
@@ -756,7 +782,6 @@ def page_admin():
         with dn2:
             do_veh     = st.selectbox("Vehicle type",
                 ["Bike","Auto","Van","Truck","Mini-Truck"],  key="adm_do_veh")
-            # FIX C: Vehicle Number field
             do_veh_num = st.text_input("Vehicle number *",   placeholder="e.g. KA-01-AB-1234", key="adm_do_veh_num")
             do_bank    = st.text_input("Bank name *",        key="adm_do_bank")
         with dn3:
@@ -774,7 +799,6 @@ def page_admin():
                     st.warning(f"⚠️ Mobile already registered — Driver ID: **{ex['Driver ID']}**")
                 else:
                     did=gen_driver_id()
-                    # FIX C: include vehicle number in row
                     append_row("driver_onboard",[
                         did,do_name,do_mob,do_email,do_veh,do_veh_num,
                         do_bank,do_acct,do_ifsc,do_upi,
@@ -784,7 +808,7 @@ def page_admin():
                     st.success(f"✅ Driver onboarded! Permanent Driver ID: **`{did}`**")
                     st.session_state.task_done=True; st.rerun()
 
-    # TAB 5 — Orders (FIX D: today's orders by default)
+    # TAB 5 — Orders
     with tabs[5]:
         st.markdown(sl("📋 All Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -792,7 +816,6 @@ def page_admin():
             st.info("No orders yet.")
         else:
             today_str=str(date.today())
-            # FIX D: filter toggle
             show_all=st.checkbox("Show all orders (default: today only)", key="admin_show_all")
             if not show_all and "ORDER DATE" in df_o.columns:
                 df_show=df_o[df_o["ORDER DATE"].astype(str)==today_str]
@@ -837,7 +860,6 @@ def page_sales():
 
     # ── TAB 0: New Order ──────────────────────────────────────────────────────
     with tabs[0]:
-        # FIX B: Customer lookup auto-fills ALL fields including Lat/Long
         st.markdown(sl("🔍 Customer Lookup"), unsafe_allow_html=True)
         lc1,lc2,lc3=st.columns([2,2,1])
         with lc1: lk_id =st.text_input("Customer ID",placeholder="CUST-XXXXXX",key="lk_id")
@@ -859,7 +881,6 @@ def page_sales():
 
         cust=st.session_state.get("cust_data",{})
 
-        # FIX B: show auto-filled location banner if customer found
         if cust:
             auto_lat=str(cust.get("Latitude","")).strip()
             auto_lng=str(cust.get("Longitude","")).strip()
@@ -872,7 +893,6 @@ def page_sales():
                 f'</div>', unsafe_allow_html=True)
         st.divider()
 
-        # Order details
         st.markdown(sl("📦 Order Details"), unsafe_allow_html=True)
         oc1,oc2,oc3=st.columns(3)
         with oc1:
@@ -880,11 +900,9 @@ def page_sales():
             o_date=st.date_input("Order date",value=date.today(),key="o_date")
         with oc2:
             cities=["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
-            # FIX B: city auto-filled from customer data
             auto_city=cust.get("City","Bengaluru") if cust else "Bengaluru"
             ci=cities.index(auto_city) if auto_city in cities else 0
             o_city=st.selectbox("City *",cities,index=ci,key="o_city")
-            # Order time shown as read-only — captured on submit
             st.text_input("⏰ Ordered time (auto on submit)",
                            value=datetime.now().strftime("%H:%M:%S"),
                            disabled=True,key="o_time_disp")
@@ -892,7 +910,6 @@ def page_sales():
             o_dcoff=st.time_input("Delivery cut-off",key="o_dcoff")
             o_sopen=st.time_input("Shop opens at",key="o_sopen")
 
-        # Customer details — all auto-filled from lookup
         st.markdown(sl("👤 Customer Details"), unsafe_allow_html=True)
         cc1,cc2,cc3=st.columns(3)
         with cc1:
@@ -905,7 +922,6 @@ def page_sales():
             st.text_input("Sales executive",value=user["name"],disabled=True,key="c_se")
             st.text_input("SE UID",         value=user["uid"], disabled=True,key="c_seuid")
 
-        # SKU
         st.markdown(sl("🛒 SKU / Product"), unsafe_allow_html=True)
         df_sku=active_skus()
         if df_sku.empty:
@@ -934,7 +950,6 @@ def page_sales():
             else:
                 st.info("Enter quantity — order total will appear here.")
 
-            # FIX B: Shop location — auto-filled from Customer Onboard Data
             st.markdown(sl("📍 Shop Location (auto from customer record)"), unsafe_allow_html=True)
             auto_addr=str(cust.get("Shop Address","")).strip() if cust else ""
             auto_lat =str(cust.get("Latitude","")).strip()     if cust else ""
@@ -944,7 +959,6 @@ def page_sales():
                                   help="Auto-filled from customer record")
             c_lat_col,c_lng_col=st.columns(2)
             with c_lat_col:
-                # FIX B: lat is filled from customer record (read-only if present)
                 o_lat=st.text_input("Latitude",value=auto_lat,key="o_lat",
                                      disabled=bool(auto_lat),
                                      help="Loaded from Customer Onboard Data")
@@ -953,9 +967,8 @@ def page_sales():
                                      disabled=bool(auto_lng),
                                      help="Loaded from Customer Onboard Data")
 
-            map_q=f"{auto_lat},{auto_lng}" if (auto_lat and auto_lng) else o_addr
-            if map_q.strip():
-                st.markdown(map_embed(map_q,240),unsafe_allow_html=True)
+            if auto_lat and auto_lng:
+                st.markdown(map_embed(auto_lat, auto_lng, 240), unsafe_allow_html=True)
                 st.caption("📍 Customer's registered shop location.")
 
             st.divider()
@@ -969,7 +982,6 @@ def page_sales():
                 else:
                     soid="SO-"+o_id.replace("ORD-","")
                     ordered_time=datetime.now().strftime("%H:%M:%S")
-                    # FIX B: include Latitude + Longitude in base sheet row
                     append_row("base",[
                         o_id,soid,o_city,
                         str(o_date),"",ordered_time,
@@ -987,9 +999,11 @@ def page_sales():
                     st.success(f"✅ Order **{o_id}** submitted!  Total: **₹{o_total:,.2f}**")
                     st.session_state.cust_data={}; st.session_state.task_done=True; st.balloons()
 
-    # ── TAB 1: Customer Onboard (FIX A: Get My Location button) ──────────────
+    # ── TAB 1: Customer Onboard ───────────────────────────────────────────────
     with tabs[1]:
         st.markdown(sl("👤 Customer Onboarding"), unsafe_allow_html=True)
+
+        # Search existing
         sc1,sc2=st.columns([3,1])
         with sc1: co_search=st.text_input("Search existing customer by mobile",key="co_search")
         with sc2:
@@ -1006,6 +1020,7 @@ def page_sales():
                 st.info("Not found — fill form below to onboard.")
         st.divider()
 
+        # New customer form
         st.markdown("#### New customer details")
         nc1,nc2=st.columns(2)
         with nc1:
@@ -1020,56 +1035,41 @@ def page_sales():
                 ["A","B","C","Premium","Wholesale","Retail"],key="co_cls")
             co_addr=st.text_input("Shop address *",
                 placeholder="e.g. 12/3 MG Road, Bengaluru",
-                key="co_addr",
-                help="Type the shop address — plain text, no map search needed")
+                key="co_addr")
 
-        # ── GPS + Location section ────────────────────────────────────────────
-        st.markdown(sl("📌 GPS Location"), unsafe_allow_html=True)
+        # ── GPS SECTION ───────────────────────────────────────────────────────
+        st.markdown(sl("📍 Shop GPS Location"), unsafe_allow_html=True)
 
-        # Step 1: GPS button (query-params approach — works on mobile & desktop)
-        st.markdown("**Step 1 — Tap to capture your current location:**")
-        gps_lat, gps_lng = geo_location_button()
+        st.markdown("**Tap the button below to capture your current location:**")
 
-        # Step 2: Manual fallback
-        st.markdown("**Step 2 — Or enter coordinates manually:**")
-        st.caption("💡 How to get coordinates: Open Google Maps → long-press on the shop → copy the numbers shown at the bottom")
-        lat_c, lng_c = st.columns(2)
-        with lat_c:
-            co_lat = st.text_input("Latitude *",
-                                   value=gps_lat,
-                                   placeholder="e.g. 12.9716",
-                                   key="co_lat")
-        with lng_c:
-            co_lng = st.text_input("Longitude *",
-                                   value=gps_lng,
-                                   placeholder="e.g. 77.5946",
-                                   key="co_lng")
+        # The GPS component — handles query param reading + renders button
+        captured_lat, captured_lng = gps_capture_component()
 
-        # Map shows ONLY when both lat & long are filled — based on coordinates only
-        if co_lat.strip() and co_lng.strip():
-            try:
-                float(co_lat); float(co_lng)   # validate numbers
-                st.markdown(
-                    f'<div class="map-frame"><iframe width="100%" height="240" frameborder="0"'
-                    f' style="border:0;display:block" allowfullscreen'
-                    f' src="https://maps.google.com/maps?q={co_lat.strip()},{co_lng.strip()}&output=embed&z=16">'
-                    f'</iframe></div>',
-                    unsafe_allow_html=True)
-                st.caption(f"📍 Map showing: {co_lat.strip()}, {co_lng.strip()} — verify the pin is on the correct shop.")
-            except ValueError:
-                st.warning("⚠️ Latitude and Longitude must be numbers (e.g. 12.9716, 77.5946).")
+        # Show the captured coordinates in a styled box
+        if captured_lat and captured_lng:
+            st.markdown(
+                f'<div class="gps-box">'
+                f'✅ &nbsp;Location captured &nbsp;|&nbsp; '
+                f'<span style="color:#185fa5">Lat: {captured_lat}</span>'
+                f' &nbsp;|&nbsp; '
+                f'<span style="color:#185fa5">Lng: {captured_lng}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            # Show map preview using the captured coordinates
+            st.markdown(map_embed(captured_lat, captured_lng, 260), unsafe_allow_html=True)
+            st.caption(f"📍 Verify the pin is on the correct shop location. GPS: {captured_lat}, {captured_lng}")
+        else:
+            st.info("📍 Press the button above to capture your location. The map will appear here after capture.")
 
+        # ── ONBOARD BUTTON ────────────────────────────────────────────────────
+        st.divider()
         if st.button("✅ Onboard Customer", type="primary", use_container_width=True, key="co_btn"):
             if not all([co_name, co_mob, co_shop, co_addr]):
                 st.error("Fill all required (*) fields.")
-            elif not co_lat.strip() or not co_lng.strip():
-                st.error("📍 Latitude and Longitude are required. Use the GPS button or enter manually.")
+            elif not captured_lat or not captured_lng:
+                st.error("📍 Location required — press 'Get My Current Location' button above first.")
             else:
-                try:
-                    float(co_lat); float(co_lng)
-                except ValueError:
-                    st.error("Latitude and Longitude must be valid numbers.")
-                    st.stop()
                 with st.spinner("Checking for duplicates…"):
                     ex = find_row("customer_onboard", "Mobile", co_mob.strip())
                 if ex:
@@ -1079,18 +1079,22 @@ def page_sales():
                     append_row("customer_onboard", [
                         cid, co_name, co_mob, co_email, co_shop,
                         co_addr, co_city, co_cls,
-                        co_lat.strip(), co_lng.strip(),
+                        captured_lat, captured_lng,
                         user["uid"], str(date.today()), "Active",
                     ])
                     load_customers.clear()
-                    # Clear captured GPS after successful save
+                    # Clear GPS state after successful save
                     st.session_state["_geo_lat"] = ""
                     st.session_state["_geo_lng"] = ""
-                    st.success(f"✅ Customer onboarded! CUST-ID: **`{cid}`**  |  GPS: {co_lat.strip()}, {co_lng.strip()}")
+                    st.success(
+                        f"✅ Customer onboarded!  "
+                        f"CUST-ID: **`{cid}`**  |  "
+                        f"GPS saved: {captured_lat}, {captured_lng}"
+                    )
                     st.session_state.task_done = True
                     st.balloons()
 
-    # ── TAB 2: My Orders (FIX D: today's orders by default) ──────────────────
+    # ── TAB 2: My Orders ──────────────────────────────────────────────────────
     with tabs[2]:
         st.markdown(sl("📋 My Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -1102,7 +1106,6 @@ def page_sales():
                 st.info("You haven't submitted any orders yet.")
             else:
                 today_str=str(date.today())
-                # FIX D: today's orders by default with toggle
                 show_all_my=st.checkbox("Show all my orders (default: today only)",key="se_show_all")
                 if not show_all_my and "ORDER DATE" in my.columns:
                     my_show=my[my["ORDER DATE"].astype(str)==today_str]
@@ -1209,9 +1212,8 @@ def page_delivery():
             if is_cur and not is_lock:
                 if shop:
                     lat=str(shop.get("Latitude","")); lng=str(shop.get("Longitude",""))
-                    shop_addr=shop.get("Shop Address","")
-                    map_q=f"{lat},{lng}" if (lat.strip() and lng.strip()) else shop_addr
-                    if map_q.strip(): st.markdown(map_embed(map_q,200),unsafe_allow_html=True)
+                    if lat.strip() and lng.strip():
+                        st.markdown(map_embed(lat, lng, 200), unsafe_allow_html=True)
                 with st.form(key=f"del_form_{i}"):
                     st.markdown("##### ✍️ Update delivery")
                     df1,df2,df3=st.columns(3)
@@ -1256,7 +1258,6 @@ def page_delivery():
             my_h=df_h[df_h["Delivery Status"]!="Pending"]
             if "return_updated_role" in my_h.columns:
                 my_h=my_h[my_h["return_updated_role"].astype(str)=="delivery Driver"]
-            # FIX D: today's history by default
             today_str=str(date.today())
             show_all_h=st.checkbox("Show all history (default: today only)",key="dd_show_all")
             if not show_all_h and "DELIVERED DATE" in my_h.columns:
